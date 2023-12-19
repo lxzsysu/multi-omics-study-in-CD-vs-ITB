@@ -1,0 +1,1 @@
+In this study, 36 treatment-naïve patients with CD, 35 ITB and 14 healthy controls were recruited. Transcriptomic, 16S rRNA and metagenomic sequencing, and targeted metabolomic measurements were performed, followed by correlation and network analyses.
