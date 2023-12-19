@@ -1,0 +1,998 @@
+# map
+hisat2 -x Homo_sapiens.GRCh38.dna.primary_assembly.fa -1 sample_clean_R1.fq.gz -2 sample_clean_R2.fq.gz  --rna-strandness RF -p 12  | samtools sort -@ 4 -m 2G -o sample.bam -T sample
+
+# stringtie
+stringtie sample.bam -o sample.gtf -p 16 -G Homo_sapiens.GRCh38.105.gtf
+
+stringtie --merge -G Homo_sapiens.GRCh38.105.gtf -o merged.gtf sample1.gtf sample2.gtf ... &&  gffcompare -r Homo_sapiens.GRCh38.105.gtf -s Homo_sapiens.GRCh38.dna.primary_assembly.fa -o ref_merged merged.gtf
+
+
+# find potential lncRNA
+###
+use strict;
+use warnings;
+use PerlPackage::gtf_parser::gtf_parser;
+use Getopt::Long;
+use File::Basename qw(basename dirname);
+my $BEGIN_TIME=time();
+
+my ($merged_gtf, $anno_gtf, $dna,$species, $out_dir);
+GetOptions(
+        "help|h" =>\&USAGE,
+        "o:s"=>\$out_dir,
+        "s:s"=>\$species,
+	"dna:s"=>\$dna,
+        "merged_gtf:s"=>\$merged_gtf,
+	"anno_gtf:s" =>\$anno_gtf,
+);
+&USAGE unless (@ARGV && $merged_gtf && $dna && $anno_gtf && $species);
+$out_dir||=".";
+mkdir $out_dir unless(-d $out_dir);
+mkdir $out_dir."/tmp" unless (-d $out_dir."/tmp");
+
+my %samples;
+my @samples;
+foreach my $argv (@ARGV){
+        my ($sample,$gtf)=split /:/,$argv;
+        $samples{$sample}=$gtf;
+        push @samples,$sample;
+}
+my $gtf_line=join(" ",map {$samples{$_}} @samples);
+system("gffcompare -r $merged_gtf -s $dna -o $out_dir/tmp/merged_sample $gtf_line");
+print "gffcompare -r $merged_gtf -s $dna -o $out_dir/tmp/merged_sample $gtf_line","\n";
+my $parser = PerlPackage::gtf_parser::gtf_parser->new(file=>$anno_gtf);
+my %pass;
+my %stat;
+while( my $transcript=$parser->next_transcript() ){
+	#step1: select transcripts with length more than 200bp, exon number more than 2 
+	if ($species eq "plant"){
+		next if $transcript->{"end"}-$transcript->{"start"}+1 <= 200 or $transcript->{"strand"} eq ".";
+	}else{
+	next if $transcript->{"end"}-$transcript->{"start"}+1 <= 200 or $transcript->filter_children(lt => 2, type => "exon") or $transcript->{"strand"} eq ".";
+	}
+	$stat{"step1"}++;
+	#step2: class_code belong to intergenic(u) or intronic(i) or  anti-sense(x)
+	next if !$transcript->filter_feature(attrs=>{class_code=>"x"}) 
+		and !$transcript->filter_feature(attrs=>{class_code=>"u"})
+		and !$transcript->filter_feature(attrs=>{class_code=>"j"})
+		and !$transcript->filter_feature(attrs=>{class_code=>"o"})
+		and !$transcript->filter_feature(attrs=>{class_code=>"i"});
+	$stat{"step2"}++;
+	$pass{$transcript->{"transcript_id"}}=1;
+}
+
+my %potential;
+foreach my $sample (@samples){
+	my %origin_id;
+	my $gtf_dir=dirname($samples{$sample});
+	open TMAP,"$gtf_dir/merged_sample.$sample.gtf.tmap" or die $!;
+	while(<TMAP>){
+		chomp;
+		next if /ref_gene_id/;
+		my ($ref_id,$cov)= (split /\t/)[1,8]; 
+		$potential{$ref_id}=1 if $cov >= 3 and $pass{$ref_id};
+	}
+	close TMAP;
+}
+
+$stat{"step3"}=keys %potential;
+open GTF, $merged_gtf or die $!;
+open OUT, ">$out_dir/potential_lncRNA.gtf";
+my %gtf;
+while(<GTF>){
+	chomp;
+	next if /#/;
+	my @c=split /\t/;
+	my ($trans_id)=$c[8]=~/transcript_id \"(\S+)\";/;
+	print OUT $_."\n" if $potential{$trans_id};
+}
+close GTF;
+close OUT;
+
+open STAT,">$out_dir/potential_lncRNA.filter_stat.txt";
+foreach my $step (sort keys %stat){
+	print STAT "$step\t$stat{$step}\n";
+}
+close STAT;
+
+`gffread $out_dir/potential_lncRNA.gtf -g $dna -w $out_dir/potential_lncRNA.fasta`;
+
+
+print STDOUT "\nDone. Total elapsed time : ",time()-$BEGIN_TIME,"s\n";
+
+sub USAGE{
+        my $usage=<<"USAGE";
+Description:Choose potential lncRNA satisfying a series prerequisite and generate gtf and fasta file for potential lncRNA
+Usage:perl $0 -merged_gtf merged.gtf -anno_gtf ref_merged.annotated.gtf sample1:sample1.gtf sample2:sample2.gtf ... -dna reference.fa [-o outdir]
+Options:
+        -merged_gtf <file>	merged.gtf, forced
+	-anno_gtf <file>	ref_merged.annotated.gtf
+	-dna <file>		reference.fa,forced
+        -o <dir>		outdir, optional, default "./"
+        -h|help help
+USAGE
+        print$usage;
+        exit;
+}
+###
+
+python CNCI_package/CNCI.py -f lncRNA.fa -o all.result -p 8
+python PLEK.1.2/PLEK.py -fasta potential_lncRNA.fasta -out PLEK.txt -thread 10 && sed -i 's/ gene=[^=]\+//' PLEK.txt
+perl PfamScan/pfam_scan.pl -fasta orf.result -dir PfamScan/data -outfile pfam.txt && grep -v "^#" pfam.txt
+
+
+# lnc venn   
+###
+use strict;
+use warnings;
+use Getopt::Long;
+use FindBin qw($Bin $Script);
+my $BEGIN_TIME=time();
+my ($cnci, $cpc, $plek, $pfam, $phyl, $gtf, $out_dir);
+GetOptions(
+        "help|h" =>\&USAGE,
+        "o:s"=>\$out_dir,
+        "cnci:s"=>\$cnci,
+	"plek:s"=>\$plek,
+	"cpc:s"=>\$cpc,
+	"pfam:s"=>\$pfam,
+	"gtf:s"=>\$gtf,
+	"phyl:s"=>\$phyl,
+);
+&USAGE unless ($gtf);
+die "ERROR:None of CNCI,cpc,pfam and phyloCSF result is provided!" if (!$cnci and !$cpc and !$plek and !$pfam and !$$phyl);
+$out_dir ||=".";
+
+my %info;
+my $head="ID";
+if($cnci){
+	open CNCI,"$cnci" or die $!;
+	while (<CNCI>) {
+		chomp;
+		my($trans,$cod)=(split /\t/)[0,1];
+		$info{$trans}{"CNCI"}="N" if $cod eq "noncoding";
+		$info{$trans}{"CNCI"}="C" if $cod eq "coding";
+	}
+	close CNCI;
+	$head.="\tCNCI";
+}
+
+if($cpc){
+	open CPC,"$cpc" or die $!;
+	while (<CPC>) {
+		chomp;
+		my($trans,$cod)=(split /\t/)[0,2];
+		$info{$trans}{"cpc"}="N" if $cod eq "noncoding";
+        	$info{$trans}{"cpc"}="C" if $cod eq "coding";
+	}
+	close CPC;
+	$head.="\tcpc";
+}
+
+if($plek){
+        open PLEK,"$plek" or die $!;
+        while (<PLEK>) {
+                chomp;
+		next if /^State/;
+                my ($cod, $trans) = (split /\t/)[0, 2];
+                $info{$trans}{"plek"}="N" if $cod eq "Non-coding";
+                $info{$trans}{"plek"}="C" if $cod eq "Coding";
+        }
+        close PLEK;
+        $head.="\tPLEK";
+}
+
+if($pfam){
+	open PFAM,"$pfam" or die $!;
+	while (<PFAM>) {
+		chomp;
+		next if(/^\#/);
+		next if /^$/;
+		my $trans = (split /\s+/)[0];
+		$info{$trans}{"pfam"}="C";
+	}
+	close PFAM;
+	$head.="\tpfam";
+}
+
+if($phyl){
+	open PHYL,"$phyl" or die $!;
+	while (<PHYL>) {
+		chomp;
+		my($trans,$cod)=(split /\t/)[0,2];
+		#$trans=~s/\.fa//;
+		$info{$trans}{"phyloCSF"}="C" if $cod > 0;
+		$info{$trans}{"phyloCSF"}="N" if $cod < 0;
+	}
+	close PHYL;
+	$head.="\tphyloCSF";
+}
+
+my @novel_id;
+open SUM,">$out_dir/coding_potential.summary.txt";
+print SUM $head."\n";
+foreach my $id (sort(keys %info)) {
+	my $line=$id;
+	my $N=0;
+	my $n=0;
+	if($cnci){
+		$info{$id}{"CNCI"}||="N";
+		$line.="\t".$info{$id}{"CNCI"};
+		$N++ if $info{$id}{"CNCI"} eq "N";
+		$n++;
+	}
+	if($cpc){
+		$info{$id}{"cpc"}||="N";
+		$line.="\t".$info{$id}{"cpc"};
+		$N++ if $info{$id}{"cpc"} eq "N";
+		$n++;
+	}
+        if($plek){
+                $info{$id}{"plek"}||="N";
+                $line.="\t".$info{$id}{"plek"};
+                $N++ if $info{$id}{"plek"} eq "N";
+                $n++;
+        }
+	if($pfam){
+		$info{$id}{"pfam"}||="N";
+		$line.="\t".$info{$id}{"pfam"};
+		$N++ if $info{$id}{"pfam"} eq "N";
+		$n++;
+	}
+	if($phyl){
+		$info{$id}{"phyloCSF"}||="N";
+		$line.="\t".$info{$id}{"phyloCSF"};
+		$N++ if $info{$id}{"phyloCSF"} eq "N";
+		$n++;
+	}
+	print SUM $line."\n";
+	push @novel_id,$id if $N==$n;
+}
+close SUM;
+
+open GTF,"$gtf" or die $!;
+open OUT,">$out_dir/novel_lncRNA.gtf";
+my %gtf;
+while(<GTF>){
+        chomp;
+        next if /#/;
+        my ($trans_id) = $_ =~ /transcript_id \"(\S+)\"/;
+        $gtf{$trans_id} .= $_."\n";
+}
+foreach my $id (@novel_id){
+        print OUT $gtf{$id};
+}
+close GTF;
+close OUT;
+sub USAGE{
+        my $usage=<<"USAGE";
+Description:Summarize coding potential transcripts
+Usage:perl $0 -cnci CNCI.txt -cpc cpc.txt -plek PLEK.txt -pfam pfam.txt -phyl phyloCSF.txt -gtf potential_lncRNA.gtf -o .
+Options:
+        -cnci <file>	CNCI.txt, optional
+	-cpc <file>	cpc.txt, optional
+	-plek <file>	PLEK.txt, optional
+	-pfam <file>	pfam.txt, optional
+	-phyl <file>	phyloCSF.txt,optional
+	-gtf <file>	a gtf contain all transcripts in CNCI,cpc,pfam,phylocCSF result,forced
+        -o <dir>	outdir, optional, default "./"
+        -h|help help
+USAGE
+        print$usage;
+        exit;
+}
+###
+
+
+cat novol.gtf known.gtf > lncRNA.gtf
+cat novol.fa known.fa > lncRNA.fa
+stringtie -e -B -p 8 -G reference.gtf -o sampleA1/gtf sampleA1.bam
+
+# lncRNA_stat
+###
+use strict;
+use warnings;
+use ScriptManager;
+use Getopt::Long;
+use File::Basename qw(basename dirname);
+use FindBin qw($Bin $Script);
+my $BEGIN_TIME=time();
+
+my ($lnc,$out_dir);
+GetOptions(
+        "help|h" =>\&USAGE,
+        "o:s"=>\$out_dir,
+	"lnc:s"=>\$lnc,
+);
+&USAGE unless ($lnc && @ARGV);
+$out_dir ||= ".";
+mkdir $out_dir unless(-d $out_dir);
+
+my %samples;
+my @samples;
+open LIST,">$out_dir/sample_list";
+foreach my $argv(@ARGV){
+        my ($sample,$gtf_dir)=split /:/,$argv;
+	push @samples,$sample;
+        $samples{$sample}=$gtf_dir;
+	print LIST "$sample\t$gtf_dir/gtf\n";
+}
+close LIST;
+
+`python $Bin/prepDE.py -i $out_dir/sample_list -g $out_dir/gene_count.csv -t $out_dir/transcript_count.csv`;
+`sed 's/,/\t/g' $out_dir/transcript_count.csv > $out_dir/transcript_count`;
+
+my %fpkm;
+foreach my $sample (@samples){
+	open T_DATA,"$samples{$sample}/t_data.ctab" or die $!;
+	while(<T_DATA>){
+		chomp;
+		next if /t_id/;
+		my ($t_name,$fpkm)=(split /\t/)[5,11];
+		$fpkm{$t_name}{$sample}=$fpkm;
+	}
+	close T_DATA;
+}
+
+open FPKM,">$out_dir/FPKM.xls";
+print FPKM join("\t","transcript_id",@samples),"\n";
+open LNC,$lnc or die $!;
+while(<LNC>){
+        chomp;
+        my @c=split /\t/;
+        next if $c[2] ne "transcript";
+        my ($trans_id)=$c[8]=~/transcript_id \"(\S+)\"/;
+	print FPKM join("\t",$trans_id,map {$fpkm{$trans_id}{$_} || 0 } @samples),"\n";
+}
+close LNC;
+close FPKM;
+
+sub USAGE{
+        my $usage=<<"USAGE";
+Description:stat read count of all transcripts and fpkm of lncRNA from stringtie result
+Usage:perl $0 -lnc lncRNA.gtf [-o outdir] sampleA:expression/sampleA sampleB:expression/sampleB ...
+Options:
+	expression/sampleA	stringtie result dir,containing gtf and t_data.ctab
+	-lnc <file>	lncRNA.gtf, forced
+        -o <dir>        outdir, optional, default "./"
+        -h|help help
+USAGE
+        print$usage;
+        exit;
+}
+###
+
+# DESeq
+###
+library(DESeq)
+rnaseqMatrix = read.table("readcount.txt", header=T, row.names=1, com='')
+rnaseqMatrix = round(rnaseqMatrix)
+rnaseqMatrix = rnaseqMatrix[rowSums(rnaseqMatrix)>=1,]
+conditions = factor(c(rep("A", 3), rep("B", 3)),levels=c("A","B"))
+exp_study = newCountDataSet(rnaseqMatrix, conditions)
+exp_study = estimateSizeFactors(exp_study)
+exp_study = estimateDispersions(exp_study)
+res = nbinomTest(exp_study, "A", "B")
+write.table(res[order(res$pval),], file='A_vs_B.DESeq.DE_results', sep='	', quote=FALSE, row.names=FALSE)
+###
+
+# GO
+###
+suppressMessages( suppressPackageStartupMessages(library("topGO")) )
+suppressPackageStartupMessages(library("stringr"))
+
+getGeneList<-function(diffFile,selectTag){
+	mat = read.table(diffFile, header=T, sep="\t",check.names=F,quote="")
+	mat = subset(mat,Regulation == selectTag)
+
+	geneList=data.frame(gene=mat[,1],Regulation=mat$Regulation)
+	return(geneList)
+}
+prepareMapping<-function(anno,GOsep=";"){
+	mat = read.delim(anno, header=T, sep="\t",check.names=F,quote="",colClasses = "character")
+        mat<-mat[mat$GO!="-",]
+	map <- mat$GO
+  	names(map) <- gsub(" ", "", mat[, 1]) ## trim the spaces
+  	return(lapply(map, function(x) gsub(" ", "", strsplit(x, split = GOsep)[[1]])))
+}
+
+getSymbolFromAnnotation<-function(anno){
+	mat = read.delim(anno, header=T, sep="\t",check.names=F,quote="",colClasses = "character")
+	col=grep("name",colnames(mat),ignore.case = TRUE)
+	col=ifelse(length(col)>0, col , 1 )
+	symbol=mat[,col]
+	names(symbol)=mat[,1]
+	return(symbol)
+}
+
+go_gene<-function(x){
+	go.genes<-genesInTerm(GOdata,x[1])[[1]]
+	sig.genes<- go.genes[go.genes %in% sigGenes(GOdata)]
+	if(length(sig.genes)<1){sig.genes<-"-"}
+	paste(sig.genes,collapse=";")
+}
+
+calculateAdjustP<-function(pvalue,method){
+	method=switch(method,BH="BH",Bonferroni="bonferroni",Holm="holm")
+	if(! method %in% c("holm", "hochberg", "hommel", "bonferroni", "BH", "BY")){
+		stop("unvalid p.adj method\n");
+	}
+	return(p.adjust(pvalue,method))
+}
+
+splitGeneInTerms<-function(rawGene,targetGene){
+	list<-strsplit(rawGene, split = ";")[[1]]
+	if(any(list %in% targetGene)){
+		return(list[list %in% targetGene])
+	}else{
+		return(c())
+	}
+}
+
+keepNdecimal<-function(x,cut=6){
+	return(round(x,cut))
+}
+
+runTopGO<-function(genelist,gene2GO,ontology,PadjustMethod,picPrefix){
+	GOdata <<- new("topGOdata", ontology = ontology, allGenes = genelist,annot = annFUN.gene2GO, gene2GO = gene2GO)
+	resultFis <- runTest(GOdata, algorithm = "classic", statistic = "fisher")
+	allGO =usedGO(object = GOdata)
+	allRes <- GenTable(GOdata, classic = resultFis, ranksOf = "classic",topNodes=length(allGO),numChar=800)
+	allRes$sig.genes <- apply(allRes,1,go_gene) 
+	allRes$category<- ontology
+	go.pvalue<-score(resultFis)
+	allRes$classic <- go.pvalue[allRes$GO.ID]
+	allRes=subset(allRes,Significant>0)
+	allRes$p.adjust<- calculateAdjustP(allRes$classic,PadjustMethod)
+	go.pvalue[go.pvalue==0]=min(go.pvalue[go.pvalue>0])
+	pdf(paste(picPrefix,".pdf",sep=""))
+	showSigOfNodes(GOdata,go.pvalue,firstSigNodes=10,useInfo= 'all')
+	dev.off()
+
+
+	return(allRes)
+}
+
+main<-function(diff,group){
+	geneID2GO=prepareMapping(anno=Annotation)
+	geneNames <- names(geneID2GO)
+	Uplist = getGeneList(diff,selectTag="Up Regulation")
+	Downlist = getGeneList(diff,selectTag="Down Regulation")
+	geneSet = switch(geneSet,'up'='Up','down'='Down','Up'='Up','Down'='Down','DEG'='DEG','deg'='DEG')
+	genetmp = switch(geneSet,
+					"DEG"=rbind(Uplist,Downlist),
+					"Up"=Uplist,
+					"Down"=Downlist,
+					"deg"=rbind(Uplist,Downlist),
+					"up"=Uplist,
+					"own"=Downlist,
+					 )
+	geneList <- factor(as.integer(geneNames %in% genetmp[,1]))
+	names(geneList) <- geneNames
+
+	suppressMessages( CC_enrichment<-runTopGO(geneList,geneID2GO,"CC",padjustMethod,paste(dOut,"/",group,".topGO_CC_top10",sep=""))  )
+	suppressMessages( BP_enrichment<-runTopGO(geneList,geneID2GO,"BP",padjustMethod,paste(dOut,"/",group,".topGO_BP_top10",sep=""))  )
+	suppressMessages( MF_enrichment<-runTopGO(geneList,geneID2GO,"MF",padjustMethod,paste(dOut,"/",group,".topGO_MF_top10",sep=""))  )
+
+	all_enrichment=rbind(CC_enrichment,BP_enrichment,MF_enrichment)
+	all_enrichment<-all_enrichment[order(as.numeric(all_enrichment$classic)),]
+
+	colnames(all_enrichment)=c("GO.ID","Term","Total","List","Expect","Pvalue","Gene","Category","adjustPvalue")
+
+	
+	geneName=getSymbolFromAnnotation(anno=Annotation)
+	UpGene<-apply(all_enrichment,1,function(x){ tmplist = splitGeneInTerms(x[7] , Uplist[,1]); ifelse(length(tmplist)>0,str_c(paste(tmplist,"(",geneName[tmplist],")",sep=""),collapse=";") ,"-")  })
+	DownGene<-apply(all_enrichment,1,function(x){ tmplist = splitGeneInTerms(x[7] , Downlist[,1]); ifelse(length(tmplist)>0,str_c(paste(tmplist,"(",geneName[tmplist],")",sep=""),collapse=";"),"-")  })
+
+	UpGeneNum <-apply(all_enrichment,1,function(x){ tmplist = splitGeneInTerms(x[7] , Uplist[,1]); length(tmplist)  })
+	DownGeneNum <-apply(all_enrichment,1,function(x){ tmplist = splitGeneInTerms(x[7] , Downlist[,1]); length(tmplist)  })
+
+	result_data <- switch(geneSet, 
+		DEG=data.frame(GO.ID=all_enrichment$GO.ID, Category=all_enrichment$Category, Term=all_enrichment$Term, Up=UpGeneNum, Down=DownGeneNum,DEG=all_enrichment$List, Total=all_enrichment$Total,Pvalue=all_enrichment$Pvalue,adjustPvalue=all_enrichment$adjustPvalue,Up_gene=UpGene,Down_gene=DownGene),
+		Up=data.frame(GO.ID=all_enrichment$GO.ID, Category=all_enrichment$Category, Term=all_enrichment$Term, Up=UpGeneNum,  Total=all_enrichment$Total,Pvalue=all_enrichment$Pvalue,adjustPvalue=all_enrichment$adjustPvalue,Up_gene=UpGene),
+		Down=data.frame(GO.ID=all_enrichment$GO.ID,Category=all_enrichment$Category,  Term=all_enrichment$Term, Down=DownGeneNum, Total=all_enrichment$Total,Pvalue=all_enrichment$Pvalue,adjustPvalue=all_enrichment$adjustPvalue,Down_gene=DownGene)
+	)
+	rownames(result_data)=result_data$GO.ID
+
+	write.table(result_data,file=paste(dOut,"/",group,".GO_enrichment.xls",sep=""),col.names=T,row.names=F,quote=F,sep='\t')
+
+	plot_df<- switch(geneSet, 
+		DEG=data.frame(category=result_data$Category,
+						term=result_data$Term, 
+						Pvalue=result_data$Pvalue, 
+						logPvalue=keepNdecimal(-log10(result_data$Pvalue),2), 
+						number=result_data$DEG, 
+						adjustPvalue=result_data$adjustPvalue,
+						logAdjustPvalue=keepNdecimal(-log10(result_data$adjustPvalue),2),
+						rich=keepNdecimal(result_data$DEG/result_data$Total)),
+		Up=data.frame(category=result_data$Category,
+						term=result_data$Term, 
+						Pvalue=result_data$Pvalue, 
+						logPvalue=keepNdecimal(-log10(result_data$Pvalue),2), 
+						number=result_data$Up, 
+						adjustPvalue=result_data$adjustPvalue,
+						logAdjustPvalue=keepNdecimal(-log10(result_data$adjustPvalue),2),
+						rich=keepNdecimal(result_data$Up/result_data$Total)),
+		Down=data.frame(category=result_data$Category,
+						term=result_data$Term, 
+						Pvalue=result_data$Pvalue, 
+						logPvalue=keepNdecimal(-log10(result_data$Pvalue),2), 
+						number=result_data$Down, 
+						adjustPvalue=result_data$adjustPvalue,
+						logAdjustPvalue=keepNdecimal(-log10(result_data$adjustPvalue),2),
+						rich=keepNdecimal(result_data$Down/result_data$Total))
+	)
+
+	if(topN > nrow(plot_df)){
+		return( list(plot_df) )
+	}else{
+		return( list(plot_df[1:topN,]) )
+	}
+}
+
+args<-commandArgs(TRUE)
+
+if (length(args) > 1){
+	conf=args[1]
+	diff.file=args[2]
+	group=args[3]
+	source(conf)
+	main(diff.file,group)
+}
+###
+
+# KEGG
+###
+suppressMessages( suppressPackageStartupMessages(library("clusterProfiler")) )
+suppressPackageStartupMessages(library("stringr"))
+
+getGeneList<-function(diffFile,selectTag){
+	mat = read.table(diffFile, header=T, sep="\t",check.names=F,quote="")
+	mat = subset(mat,Regulation == selectTag)
+
+	geneList=data.frame(gene=mat[,1],Regulation=mat$Regulation)
+	return(geneList)
+}
+prepareMapping<-function(pathwayInfo,tag="term2gene",header=T){
+	mat = pathwayInfo
+	mat=switch(tag,
+		term2gene=mat[,c(1,2)],
+		term2name=mat[,c(1,5)],
+		term2level=mat[,c(1,3,4)]
+	)
+  	return(mat)
+}
+
+
+
+transformAdjustPmethod<-function(method){
+	method=switch(method,BH="BH",Bonferroni="bonferroni",Holm="holm")
+	if(! method %in% c("holm", "hochberg", "hommel", "bonferroni", "BH", "BY")){
+		stop("unvalid p.adj method, select one from (BH,Bonferroni,Holm)\n");
+	}
+	return(method)
+}
+
+splitGeneInTerms<-function(rawGene,targetGene,split=";"){
+	list<-strsplit(rawGene, split = split)[[1]]
+	if(any(list %in% targetGene)){
+		list=list[list %in% targetGene]
+		return(list)
+
+	}else{
+		return(c())
+	}
+}
+
+makeKeggEnrichURL<-function(enrich,up,down,pathwayInfo){
+	if(ncol(pathwayInfo)<6){
+		return("-")
+	}
+	mat=pathwayInfo[!duplicated(pathwayInfo[,2]),]
+	KO=mat[,6]
+	names(KO)=mat[,2]
+	upGene=splitGeneInTerms(as.character(enrich[8]) , up,split="/")
+	downGene=splitGeneInTerms(as.character(enrich[8]) , down,split="/")
+	upKO=unique(KO[upGene])
+	downKO=unique(KO[downGene])
+	insectKO=intersect(upKO,downKO)
+	upKO=setdiff(upKO,insectKO)
+	downKO=setdiff(downKO,insectKO)
+	upKOcode=c()
+	downKOcode=c()
+	insectKOcode=c()
+	if(length(upKO)>0) upKOcode=paste(upKO,'+%23FFFFFF,red',sep="")
+	if(length(downKO)>0) downKOcode=paste(downKO,'+%23FFFFFF,green',sep="")
+	if(length(insectKO)>0) insectKOcode=paste(insectKO,'+%23FFFFFF,purple',sep="")
+	enrich[1]=gsub("[a-z]+","map",enrich[1],perl=T)
+	url=paste("http://www.kegg.jp/kegg-bin/show_pathway?map=",enrich[1],sep="")
+	url=paste0(url,"&multi_query=")
+	url=paste0(url,paste(c(upKOcode,downKOcode,insectKOcode),collapse="%0d%0a"))
+	return(url)
+
+}
+
+pasteGeneAndInfo<-function(list,pathwayInfo,sep=""){
+	if(ncol(pathwayInfo) > 5){
+		mat=pathwayInfo[!duplicated(pathwayInfo[,2]),]
+		KO=mat[,6]
+		names(KO)=mat[,2]
+		Name=mat[,7]
+		names(Name)=mat[,2]
+		if(length(list)>0) list=paste(list,"(",Name[list],"|",KO[list],")",sep="")
+	}
+	return(list)
+}
+
+getBGnumber <- function(ratio,split="/"){
+	list<-strsplit(ratio, split = split)[[1]]
+	return(as.numeric(list[1]))
+}
+
+
+getlevelinfo<-function(pathway,column){
+	apply(pathway,1,function(x){des=term2level[term2level[,1]==x[1],];des[1,column]})
+
+}
+
+keepNdecimal<-function(x,cut=6){
+	return(round(x,cut))
+}
+
+main<-function(diff,group){
+	
+	padjustMethod<-transformAdjustPmethod(padjustMethod)
+	pathwayInfo = read.delim(pathway2gene, header=F, sep="\t",check.names=F,quote="",colClasses = "character")
+	term2gene=prepareMapping(pathwayInfo=pathwayInfo,tag="term2gene")
+	term2name=prepareMapping(pathwayInfo=pathwayInfo,tag="term2name")
+	term2level<<-prepareMapping(pathwayInfo=pathwayInfo,tag="term2level",header=F)
+
+	Uplist = getGeneList(diff,selectTag="Up Regulation")
+	Downlist = getGeneList(diff,selectTag="Down Regulation")
+	geneSet=switch(geneSet,'up'='Up','down'='Down','Up'='Up','Down'='Down','DEG'='DEG','deg'='deg')
+	genetmp= switch(geneSet,
+					"DEG"=rbind(Uplist,Downlist),
+					"Up"=Uplist,
+					"Down"=Downlist,
+					 )
+	geneList <- intersect(genetmp[,1] , term2gene[,2])
+        
+	dir.create(paste0(dOut,"/",group,"_TMP"))
+	group_tmp_dir <- paste0(dOut,"/",group,"_TMP")
+	write.table(term2gene,file=paste(group_tmp_dir,"term2gene.txt",sep="/"),sep="\t",quote=F,col.names=T,row.names=F)
+ 	write.table(geneList,file=paste(group_tmp_dir,"geneList.txt",sep="/"),sep="\t",quote=F,col.names=T,row.names=F)
+ 	write.table(term2name,file=paste(group_tmp_dir,"term2name.txt",sep="/"),sep="\t",quote=F,col.names=T,row.names=F)
+
+	suppressMessages(kegg_enrichment<-enricher(geneList,TERM2GENE = term2gene, TERM2NAME = term2name, pAdjustMethod = padjustMethod  ,minGSSize=1 ,maxGSSize=100000 , qvalueCutoff = 1, pvalueCutoff=1)  )
+
+	kegg_enrichment<-kegg_enrichment[order(as.numeric(kegg_enrichment$pvalue)),]
+	write.table(kegg_enrichment,file=paste(dOut,"/",group,".KEGG_enrichment.xls",sep=""),col.names=T,row.names=F,quote=F,sep='\t')
+
+	kegg_enrichment$Total <- apply(kegg_enrichment,1,function(x){getBGnumber(x[4])})
+
+	
+	
+	UpGene<-apply(kegg_enrichment,1,function(x){ tmplist = splitGeneInTerms(x[8] , Uplist[,1],split="/");tmplist=pasteGeneAndInfo(tmplist,pathwayInfo); ifelse(length(tmplist)>0,str_c(tmplist,collapse=";") ,"-")  })
+	DownGene<-apply(kegg_enrichment,1,function(x){ tmplist = splitGeneInTerms(x[8] , Downlist[,1],split="/");tmplist=pasteGeneAndInfo(tmplist,pathwayInfo); ifelse(length(tmplist)>0,str_c(tmplist,collapse=";"),"-")  })
+
+	UpGeneNum <-apply(kegg_enrichment,1,function(x){ tmplist = splitGeneInTerms(x[8] , Uplist[,1],split="/"); length(tmplist)  })
+	DownGeneNum <-apply(kegg_enrichment,1,function(x){ tmplist = splitGeneInTerms(x[8] , Downlist[,1],split="/"); length(tmplist)  })
+
+	URL<-apply(kegg_enrichment,1,function(x){ url = makeKeggEnrichURL(x , Uplist[,1],Downlist[,1],pathwayInfo); })
+	result_data <- switch(geneSet, 
+		DEG=data.frame( PathwayID=kegg_enrichment$ID, 
+						Pathway=kegg_enrichment$Description, 
+						level1=getlevelinfo(kegg_enrichment,2), 
+						level2=getlevelinfo(kegg_enrichment,3), 
+						Up=UpGeneNum, 
+						Down=DownGeneNum,
+						DEG=kegg_enrichment$Count, 
+						Total=kegg_enrichment$Total,
+						Pvalue=kegg_enrichment$pvalue,
+						adjustPvalue=kegg_enrichment$p.adjust,
+						Up_gene=UpGene,
+						Down_gene=DownGene,
+						URL=URL
+						),
+		Up=data.frame( PathwayID=kegg_enrichment$ID, 
+						Pathway=kegg_enrichment$Description, 
+						level1=getlevelinfo(kegg_enrichment,2), 
+						level2=getlevelinfo(kegg_enrichment,3), 
+						Up=UpGeneNum, 
+						Total=kegg_enrichment$Total,
+						Pvalue=kegg_enrichment$pvalue,
+						adjustPvalue=kegg_enrichment$p.adjust,
+						Up_gene=UpGene,
+						URL=URL
+						),
+		Down=data.frame( PathwayID=kegg_enrichment$ID, 
+						Pathway=kegg_enrichment$Description, 
+						level1=getlevelinfo(kegg_enrichment,2), 
+						level2=getlevelinfo(kegg_enrichment,3), 
+						Down=DownGeneNum,
+						Total=kegg_enrichment$Total,
+						Pvalue=kegg_enrichment$pvalue,
+						adjustPvalue=kegg_enrichment$p.adjust,
+						Down_gene=DownGene,
+						URL=URL
+						)
+	)
+	rownames(result_data)=result_data$ID
+
+	write.table(result_data,file=paste(dOut,"/",group,".KEGG_enrichment.xls",sep=""),col.names=T,row.names=F,quote=F,sep='\t')
+	plot_df<- switch(geneSet, 
+		DEG=data.frame(category=result_data$level1,
+						Pathway=result_data$Pathway, 
+						Pvalue=result_data$Pvalue, 
+						logPvalue=keepNdecimal(-log10(result_data$Pvalue),2), 
+						number=result_data$DEG, 
+						adjustPvalue=result_data$adjustPvalue,
+						logAdjustPvalue=keepNdecimal(-log10(result_data$adjustPvalue),2),
+						rich=keepNdecimal(result_data$DEG/result_data$Total)),
+		Up=data.frame(category=result_data$level1,
+						Pathway=result_data$Pathway, 
+						Pvalue=result_data$Pvalue, 
+						logPvalue=keepNdecimal(-log10(result_data$Pvalue),2), 
+						number=result_data$Up, 
+						adjustPvalue=result_data$adjustPvalue,
+						logAdjustPvalue=keepNdecimal(-log10(result_data$adjustPvalue),2),
+						rich=keepNdecimal(result_data$Up/result_data$Total)),
+		Down=data.frame(category=result_data$level1,
+						Pathway=result_data$Pathway, 
+						Pvalue=result_data$Pvalue, 
+						logPvalue=keepNdecimal(-log10(result_data$Pvalue),2), 
+						number=result_data$Down, 
+						adjustPvalue=result_data$adjustPvalue,
+						logAdjustPvalue=keepNdecimal(-log10(result_data$adjustPvalue),2),
+						rich=keepNdecimal(result_data$Down/result_data$Total))
+	)
+
+	if(topN > nrow(plot_df)){
+		return( list(plot_df) )
+	}else{
+		return( list(plot_df[1:topN,]) )
+	}
+}
+
+args<-commandArgs(TRUE)
+
+if (length(args) > 1){
+	conf=args[1]
+	diff.file=args[2]
+	group=args[3]
+	source(conf)
+	main(diff.file,group)
+}
+###
+
+# fpkm / TPM
+###
+use strict;
+use warnings;
+use Getopt::Long;
+use File::Basename qw(basename);
+my $BEGIN_TIME=time();
+
+my ($out_dir,$Annotation,$type);
+GetOptions(
+	"help|?" =>\&USAGE,
+	"o:s"=>\$out_dir,
+	"Annotation:s"=>\$Annotation,
+	"t:s"=>\$type,
+) or &USAGE;
+&USAGE unless ($Annotation and @ARGV);
+$out_dir ||=".";
+$type ||="fpkm";
+
+mkdir $out_dir unless(-d $out_dir);
+
+open ANNO,$Annotation or die $!; 
+my %gene;
+while (<ANNO>) {
+	chomp;
+	my @c=(split /\t/)[0,5];
+	$gene{$c[0]}=$c[1];
+}
+close ANNO;
+
+my %read_count;
+my %read_count_tpm;
+my %total;
+my %total_tpm;
+my @samples;
+foreach my $file (@ARGV){
+	my $sample=basename($file);
+	$sample=~s/\.read_count//;
+	push @samples,$sample;
+	open FILE,$file or die $!;
+	while (<FILE>) {
+		chomp;
+		my @c=split /\t/;
+		if( $gene{$c[0]}){
+			$read_count{$c[0]}{$sample}=$c[1];
+			$read_count_tpm{$c[0]}{$sample}=$c[1]*1000/$gene{$c[0]};
+			$total{$sample}+=$c[1];
+			$total_tpm{$sample}+=$c[1]*1000/$gene{$c[0]};
+		}
+	}
+	close FILE;
+}
+
+open READ_COUNT,">$out_dir/read_count";
+print READ_COUNT join("\t","Gene_ID",@samples)."\n"; 
+open RPKM,">$out_dir/fpkm";
+print RPKM join("\t","Gene_ID",@samples)."\n";
+open EXPR,">$out_dir/Expression.xls";
+print EXPR join("\t","Gene_ID",map {$_.":read count\t".$_.":$type"} @samples)."\n";
+foreach my $gene (sort {$a cmp $b} keys %read_count) {
+	my @fpkm=map { my $fpkm=eval{ $read_count{$gene}{$_}*(10**9)/$total{$_}/$gene{$gene}};
+		die "read count of gene $gene in sample $_ is $read_count{$gene}{$_}, total read count of $_ is $total{$_}, gene length is $gene{$gene}, please check!\n" if $@;
+		$fpkm
+	 } @samples;
+	my @tpm=map { my $tpm=eval{$read_count_tpm{$gene}{$_}*(10**6)/$total_tpm{$_}};
+		die "read count of gene $gene in sample $_ is $read_count_tpm{$gene}{$_}, total read count of $_ is $total_tpm{$_}, gene length is $gene{$gene}, please check!\n" if $@;
+		$tpm
+	} @samples;
+	my @expr;
+	if($type eq "fpkm"){
+		@expr=map {join("\t",$read_count{$gene}{$_} , $read_count{$gene}{$_}*(10**9)/$total{$_}/$gene{$gene})} @samples;
+		print RPKM join("\t",$gene,@fpkm)."\n";
+	}elsif($type eq "TPM"){
+		@expr=map {join("\t",$read_count{$gene}{$_} , $read_count_tpm{$gene}{$_}*(10**6)/$total_tpm{$_})} @samples;
+		print RPKM join("\t",$gene,@tpm)."\n";
+	}else{
+		die "$type is not fpkm or TPM;Please specify \"-t TPM\" or \"-t fpkm\"\n";
+	}
+	print READ_COUNT join("\t",$gene,map{$read_count{$gene}{$_}} @samples)."\n";
+	print EXPR join("\t",$gene,@expr)."\n";
+}
+close READ_COUNT;
+close RPKM;
+close EXPR;
+
+
+sub USAGE {
+        my $usage=<<"USAGE";
+Usage:perl $0 -Annotation Annotation.txt sampleA.read_count sampleB.read_count [-o out_dir] [-t fpkm/TPM]
+Description:Calculate fpkm or TPM of samples using read count from htseq-count
+Options:
+	-Annotation <file>	Annotation,with column 1 is gene name and column 6 is gene length,forced
+        -o <dir>	output directory,optional,default "./"
+		-t <type>	expression calulate type (fpkm/TPM),default "fpkm"
+        -h              help
+
+USAGE
+        print $usage;
+        exit;
+}
+
+
+sub GetTime {
+	my ($sec, $min, $hour, $day, $mon, $year, $wday, $yday, $isdst)=localtime(time());
+	return sprintf("%4d-%02d-%02d %02d:%02d:%02d", $year+1900, $mon+1, $day, $hour, $min, $sec);
+}
+###
+
+
+# GSVA
+###
+suppressMessages(library("optparse"))
+option_list <- list(
+  make_option(c("-r","--read_count"),type="character",help="r"),
+  make_option(c("-g","--group"),type="character",help="group"),
+  make_option(c("-c","--contrast"),type="character",help="contrast"),
+  make_option(c("-a","--anno_gmt"),type="character",help="anno_gmt"),
+  make_option(c("-o","--outpath"),type="character",default="./",help="out")
+)
+opt <- parse_args(OptionParser(option_list=option_list))
+if(is.null(opt$read_count)|is.null(opt$contrast)|is.null(opt$group)|is.null(opt$anno_gmt)){
+  print_help(OptionParser(option_list=option_list));
+  stop("must give  and -r/--read_count  and -g/--group and -c/--contrast and  -a/--anno_gmt", call.=FALSE)
+ }
+
+library(tidyverse)
+library(ggplot2)
+library(clusterProfiler)
+library(GSEABase)
+library(GSVA)
+library(limma)
+library(pheatmap)
+library(patchwork)
+
+gmt_file <- opt$anno_gmt
+read_count_file<- opt$read_count
+group_file <- opt$group
+contrast_file <- opt$contrast
+outdir <-  opt$outpath
+
+
+
+
+
+
+gmt2list <- function(gmtfile){
+  sets <- as.list(read_lines(gmtfile))
+    for(i in 1:length(sets)){
+        tmp = str_split(sets[[i]], '\t')
+    n = length(tmp[[1]])
+        names(sets)[i] = tmp[[1]][1]
+    sets[[i]] = tmp[[1]][3:n]
+        rm(tmp, n)
+  }
+    return(sets)
+}
+geneset = gmt2list(gmt_file)
+geneset <- getGmt(gmt_file)
+geneset2 <- read.gmt(gmt_file)
+
+
+group<-read.table(group_file,head=F,stringsAsFactors = F,sep="\t")#组名\t样本
+
+contrast <-read.table(contrast_file,head=F,stringsAsFactors = F,sep="\t",colClasses = c("character"))
+
+n_contrast<- nrow(contrast)
+for (compare in 1:n_contrast) {
+
+    control <- as.character(contrast[compare,1])
+    treat <- as.character(contrast[compare,2])
+
+    # control_index = which(match(group[,1],c(control,treat))==1)
+    # treat_index = which(match(group[,1],c(control,treat))==2)
+    # control_n<-length(control_index)
+    # treat_n <- length(treat_index)
+    # group <- group[c(control_index,treat_index),]
+    group<- rbind(group[group[,1]==contrast[compare,1],],group[group[,1]==contrast[compare,2],])
+    control_n<- nrow(group[group[,1]==contrast[compare,1],])
+    treat_n <- nrow(group[group[,1]==contrast[compare,2],])
+    exp <- read.table(read_count_file,row.names = 1,header = T,sep = '\t')
+    exp<- exp[,match(group[,2],colnames(exp))]
+    #write.table(exp,paste(outdir,"readcount.txt",sep="/"),row.names=T,col.names=T,sep="\t",quote=FALSE)
+
+    es <- gsva(as.matrix(exp), geneset,kcdf="Poisson",min.sz=10, max.sz=500,verbose=TRUE)
+
+    group_list = c(rep(control, control_n), rep(treat, treat_n))
+    design <- model.matrix(~ factor(group_list))
+    colnames(design)=levels(factor(group_list))
+    row.names(design)<-colnames(es)
+    #contrast.matrix<-makeContrasts(paste0(unique(group_list),collapse = "-"),
+    #	st.matrix<-makeContrasts("Trt-ck",	levels = design)a
+    #####################
+    #注意这里的比较组顺序 H-A 就是H/A
+    ####################
+    compare_info <- paste(treat,control,sep="-")
+    compare_name <- paste(control,treat,sep="_vs_")
+    contrast.matrix<-makeContrasts(compare_info,levels = design)
+    fit <- lmFit(es, design)
+    fit2 <- contrasts.fit(fit, contrast.matrix)
+    fit <- eBayes(fit2)
+    allGeneSets <- topTable(fit, coef=compare_info, number=Inf)
+    write.table(es,paste(outdir,paste(compare_name,"result.txt",sep="_"),sep="/"),row.names=T,col.names=T,sep="\t",quote=FALSE)
+    write.table(allGeneSets,paste(outdir,paste(compare_name,"Limma.result.txt",sep="_"),sep="/"),row.names=T,col.names=T,sep="\t",quote=FALSE)
+    DEgeneSets <- topTable(fit, coef=compare_info, number=Inf,p.value=0.05, adjust="none")
+
+    nrDEG = na.omit(DEgeneSets)
+    es_heatmap <- es[row.names(es) %in% row.names(nrDEG),]
+    annotation_col = data.frame(Type = factor(c(rep(control, control_n), rep(treat, treat_n))))
+
+    rownames(annotation_col) = colnames(exp)
+
+     
+
+    png(paste(outdir,paste(compare_name,"GSVA_heatmap.png",sep="_"),sep="/"))
+    pheatmap(es_heatmap, show_rownames=0,show_colnames = 1,annotation_col = annotation_col, )
+    dev.off()
+    pdf(paste(outdir,paste(compare_name,"GSVA_heatmap.pdf",sep="_"),sep="/"))
+    pheatmap(es_heatmap, show_rownames=0,show_colnames = 1,annotation_col = annotation_col, )
+    dev.off()
+
+    if(nrow(es_heatmap) < 30){es_heatmap1 <- es_heatmap[seq(1,nrow(es_heatmap),1),]}else{es_heatmap1 <- es_heatmap[seq(1,30,1),]}
+    #p <- pheatmap(es_heatmap1, show_rownames=1, show_colnames = 1,annotation_col = annotation_col,fontsize=9, width=15, height=12)
+
+    png(paste(outdir,paste(compare_name,"GSVA_top_heatmap_name.png",sep="_"),sep="/"))
+    pheatmap(es_heatmap1, show_rownames=1, show_colnames = 1,annotation_col = annotation_col,fontsize=9, width=15, height=12)
+    dev.off()
+    pdf(paste(outdir,paste(compare_name,"GSVA_top_heatmap_name.pdf",sep="_"),sep="/"))
+    pheatmap(es_heatmap1, show_rownames=1, show_colnames = 1,annotation_col = annotation_col,fontsize=9, width=15, height=12)
+    dev.off()
+}
+###

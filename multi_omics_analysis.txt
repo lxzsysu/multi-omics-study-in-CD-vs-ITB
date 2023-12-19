@@ -1,0 +1,99 @@
+# metabolin.tsv
+# taxon.tsv
+# map.txt
+
+source /PERSONALBIO/work/microbio/m00/project/MetaDenovo_V1/envs/miniconda3/bin/activate /PERSONALBIO/work/microbio/m13/bin/env/PERSONALBIO/Publicsoftware/miniconda2/envs/r-3.3
+
+mo=/PERSONALBIO/work/microbio/m13/bin/shanghai_to_nanjing/multi-omics
+
+biom convert -o metabolin.biom -i metabolin.txt --table-type="taxon table"
+biom convert -o taxon.biom -i taxon.txt --table-type="taxon table"
+
+beta_diversity.py -i metabolin.biom -m bray_curtis -o beta_div/
+beta_diversity.py -i taxon.biom -m bray_curtis -o beta_div/
+
+principal_coordinates.py -i beta_div/bray_curtis_taxon.txt -o beta_div/bray_curtis_taxon_pc.txt 
+principal_coordinates.py -i beta_div/bray_curtis_metabolin.txt -o beta_div/bray_curtis_metabolin_pc.txt 
+
+/PERSONALBIO/work/microbio/m13/bin/env/PERSONALBIO/Publicsoftware/miniconda2/envs/r-3.3/bin/python  /PERSONALBIO/work/microbio/m13/bin/env/PERSONALBIO/Publicsoftware/miniconda2/envs/r-3.3/bin/compare_distance_matrices.py --method mantel -i beta_div/bray_curtis_taxon.txt,beta_div/bray_curtis_metabolin.txt -o mantel -n 999
+
+transform_coordinate_matrices.py -i beta_div/bray_curtis_taxon_pc.txt,beta_div/bray_curtis_metabolin_pc.txt -r 999 -o procrustes_results
+
+source /PERSONALBIO/work/microbio/m00/project/MetaDenovo_V1/envs/miniconda3/bin/deactivate
+source /PERSONALBIO/work/microbio/m00/project/MetaDenovo_V1/envs/miniconda3/bin/activate /PERSONALBIO/work/microbio/m00/project/MetaDenovo_V1/envs/miniconda3/envs/R3.6.1
+LD_LIBRARY_PATH="/PERSONALBIO/work/microbio/m13/bin/lib:/PERSONALBIO/work/microbio/m13/miniconda3/envs/imagemagick/lib:$LD_LIBRARY_PATH"
+export LD_LIBRARY_PATH
+make_emperor.py -c -i procrustes_results/ -o procrustes_emperor_plots -m map.txt
+
+Rscript ${mo}/CIA.R taxon.txt metabolin.txt 
+gs -dSAFER -dBATCH -dNOPAUSE -r300 -sDEVICE=pngalpha -sOutputFile=cia/cia_plot.png cia/cia_plot.pdf 
+
+
+#sed 's/.*g__//' otu_table_L6.xls | sed '/uncultured/d;/unclassified/d;/Other/d;/unidentified/d' > l6.txt 
+Rscript ${mo}/corr_heatmap.R spearman metabolin.txt taxon.txt 
+mkdir heatmap
+mv output_* heatmap_* heatmap
+
+head -1 taxon.txt > ntw.txt
+sed 1d taxon.txt | sed 's/^/Taxon@/' >> ntw.txt 
+sed 1d metabolin.txt | sed 's/^/Metabolin@/' >> ntw.txt 
+
+source /PERSONALBIO/work/microbio/m00/project/MetaDenovo_V1/envs/miniconda3/bin/deactivate
+source /PERSONALBIO/work/microbio/m00/project/MetaDenovo_V1/envs/miniconda3/bin/activate /PERSONALBIO/work/microbio/m13/bin/env/PERSONALBIO/Publicsoftware/miniconda2/envs/r-3.3
+/PERSONALBIO/work/microbio/m00/project/MetaDenovo_V1/envs/miniconda3/envs/R3.6.1/bin/Rscript ${mo}/network_spearman_species.R ntw.txt 
+
+#Rscript ../ntw.R ntw.txt 
+awk 'FNR==1{print $1,"\t","PP","\t",$2} FNR>1{if($3>0.8 && $4<0.01 || $3<-0.8 && $4<0.01 ){print $1,"\t",$3,"\t",$2}}' otu_network.0.03.spearman.otu.corr > network.sif
+
+sed '/^Metabolin@.* Metabolin@/d' network.sif -i
+sed '/^Taxon@.* Taxon@/d' network.sif -i
+
+sed -i '1d' network.sif
+awk -F "\t" '{if($2>0){print $1"\t+\t"$3}else{print $1"\t-\t"$3}}' network.sif > net.sif
+sed -i 's/ //g' net.sif
+sed -i '/unidentified/d' net.sif
+mv net.sif network.sif
+
+/PERSONALBIO/work/microbio/m00/project/MetaDenovo_V1/envs/miniconda3/envs/R3.6.1/bin/Rscript ${mo}/plot_network.R map.txt network.sif otu_network.txt
+
+mkdir network
+mv network.sif network.pdf network/
+mv otu_network.0.03.spearman.otu.corr network/spearman_corr.tsv
+#pigz -p 8 network/spearman_corr.tsv
+
+source /PERSONALBIO/work/microbio/m00/project/MetaDenovo_V1/envs/miniconda3/bin/deactivate
+source /PERSONALBIO/work/microbio/m00/project/MetaDenovo_V1/envs/miniconda3/bin/activate /PERSONALBIO/work/microbio/m00/project/MetaDenovo_V1/envs/miniconda3/envs/R3.6.1
+gs -dSAFER -dBATCH -dNOPAUSE -r300 -sDEVICE=pngalpha -sOutputFile=heatmap/heatmap_spearman.png heatmap/heatmap_spearman.pdf
+gs -dSAFER -dBATCH -dNOPAUSE -r300 -sDEVICE=pngalpha -sOutputFile=heatmap/heatmap_spearman_circle.png heatmap/heatmap_spearman_circle.pdf
+gs -dSAFER -dBATCH -dNOPAUSE -r300 -sDEVICE=pngalpha -sOutputFile=network/network.png network/network.pdf
+
+## report ################################################
+cp -r $mo/report_mo ./
+
+mkdir -p general
+cp report_mo/general/general.txt general/
+
+contract_id=$(pwd | awk -F "/" "{print \$(NF-1)}")
+project_id=$(pwd | awk -F "/" "{print \$(NF)}")
+num_samples=`echo $[$(cat map.txt | wc -l) - 1]`
+time=`date '+%Y-%m-%d'`
+employee_num="PB120211845"; 
+
+sed -i "s/YFnj2019803/$contract_id/; s/MbPL202007310/$project_id/; s/10/$num_samples/; 
+s/PB120160827/$employee_num/;s/2020-08-03/$time/" general/general.txt 
+
+mkdir img table
+cat mantel/mantel_results.txt | sed '/^#/d' > table/mantel.txt 
+cat procrustes_results/procrustes_results.txt | sed '/^#Warning/d' > table/procrustes.txt 
+cat cia/cia_results.txt | grep -E "Observation|Simulated p-value" | sed 's/Observation/RV/;s/: /\t/;1s/^/Monte-Carlo test\t-\n/' > table/cia.txt
+cp cia/cia_plot.png img/cia.png
+cp heatmap/heatmap_spearman.png img/heatmap.png
+cp network/network.png img/network.png
+
+source /PERSONALBIO/work/microbio/m00/project/MetaDenovo_V1/envs/miniconda3/bin/deactivate
+source /PERSONALBIO/work/microbio/m00/project/MetaDenovo_V1/envs/miniconda3/bin/activate /PERSONALBIO/work/microbio/m00/project/MetaDenovo_V1/envs/miniconda3/envs/metadenovo_v2
+python ./report_mo/md2html.py report_mo/multi-omics.md > report.html
+
+cp -r report_mo/static ./ 
+
+

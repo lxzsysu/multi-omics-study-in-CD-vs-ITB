@@ -1,0 +1,196 @@
+#先创建一个目录，用来开展分析
+
+mkdir -p  Meta && cd Meta
+
+#准备好原始数据A样本，放在目录1_rawdata里
+
+1_rawdata/
+├── A_R1.fq.gz
+└── A_R2.fq.gz
+
+#激活环境
+conda activate metagenome
+threads=2
+
+#先进行fastqc分析
+
+mkdir FastQC
+fastqc -t ${threads} 1_rawdata/* -o FastQC
+multiqc FastQC/* -o MultiQC_fastqc
+
+#使用fastp进行质量控制
+
+mkdir -p 2_cleandata Fastp
+sample=A 
+fastp -i 1_rawdata/${sample}_R1.fq.gz -I 1_rawdata/${sample}_R2.fq.gz \
+        -o 2_cleandata/${sample}_clean_R1.fq.gz -O 2_cleandata/${sample}_clean_R2.fq.gz \
+        -l 50 -g -w ${threads} -W 5 -5 -q 20 -u 30 \
+        -j Fastp/${sample}_fastp.json -h Fastp/${sample}_fastp.html 
+
+multiqc Fastp/*  -o MultiQC_fastp
+
+#宿主过滤，可选步骤
+
+bowtie2 -p ${threads} -x hg38 -1 2_cleandata/${sample}_clean_R1.fq.gz -2 2_cleandata/${sample}_clean_R2.fq.gz -S sample.sam --un-conc-gz 2_cleandata/${sample}_clean_nonhost.fq.gz 
+rename ".fq.1.gz" "_R1.fq.gz"  2_cleandata/*fq.1.gz
+rename ".fq.2.gz" "_R2.fq.gz"  2_cleandata/*fq.2.gz
+
+# reads 注释kraken2
+mkdir -p kraken2
+kraken2 --paired --threads ${threads} --confidence 0.5 --memory-mapping --db Kraken2db \
+    --report kraken2/${sample}_kraken2.report --output /dev/null \
+    2_cleandata/{}_clean_nonhost_R1.fq.gz 2_cleandata/${sample}_clean_nonhost_R2.fq.gz 
+
+taxonomies="domain kingdom phylum class order family genus species"
+
+for taxo in ${taxonomies};do
+      level=$(echo ${taxo:0:1} | tr "a-z" "A-Z")
+       echo $level
+       bracken \
+        -r 150 -l ${level} \
+        -d ~LN00/database/Kraken2db \
+        -i kraken2/${sample}_kraken2.report \
+        -o kraken2/${sample}_${level}.bracken > /dev/null
+        # extract taxonID and abundance 
+        awk -F "\t" -v sample=${sample} 'NR==1{print "taxonID\t",sample};NR>1{print $2"\t"$6}' kraken2/${sample}_${level}.bracken \
+            > kraken2/${sample}_${level}.summary
+done
+
+#序列拼接
+
+mkdir 3_assembly
+megahit -1 2_cleandata/${sample}_clean_nonhost_R1.fq.gz -2 2_cleandata/${sample}_clean_nonhost_R2.fq.gz \
+         --out-prefix ${sample}  \
+        -o ${sample}_megahit_out -t ${threads} # --preset meta-large 
+mv 3_assembly/*_megahit_out/*.contigs.fa 3_assembly
+cp 3_assembly/*.contigs.fa 3_assembly/all.contigs.fa
+
+
+#去冗余
+mmseqs easy-linclust 3_assembly/all.contigs.fa 3_assembly/all_mmseqs mmseqs_tmp/ \
+    -c 0.95 --cov-mode 1 --min-seq-id 0.99 --threads ${threads}  -v 1 --cluster-mode 2 
+
+rm -r mmseqs_tmp/
+
+#基因预测
+
+mkdir -p 4_gene
+seqkit  split -w 0 -f -s 50000 -O gene_tmp    3_assembly/all_mmseqs_rep_seq.fasta
+
+# 基因预测
+ls gene_tmp/*.part_*.fasta | xargs -i -P ${threads} gmhmmp -a -f G -m MetaGeneMark_v1.mod  {} -o {}.gff -D {}.gene -A {}.pro 
+
+ls gene_tmp/*.gene | xargs -i -P ${threads} sh -c " cat {} | sed 's/ # /;/g' | cut -d';' -f1,2,3,4,6 | sed 's/;/_/g;' | awk  '{if(\$1~/^>/){print \"\n\"\$0}else{printf \$0}}END{print }' > {}_tmp 
+    " 
+	
+## 预测基因中间文件
+cat gene_tmp/*.gene_tmp | grep -v '^$' | awk '/^>/{print ">gene_"(NR+1)/2" "$1}!/^>/{print $0}' | sed 's/ >/ /' > 4_gene/genes_predict.fa
+
+# 基因去重复 
+vsearch --derep_fulllength 4_gene/genes_predict.fa  --output 4_gene/genes_derep.fa --fasta_width 0 --notrunclabels --uc  4_gene/genes_derep.uc
+
+# 预测蛋白文件处理
+ls gene_tmp/*.pro | xargs -i -P4 sh -c "
+    cat {} | sed 's/ # /;/g' \
+    | cut -d';' -f1,2,3,4,6 | sed 's/;/_/g;' \
+    | awk  '{if(\$1~/^>/){print \"\n\"\$0}else{printf \$0}}END{print }' > {}_tmp 
+    " 
+## 预测蛋白中间文件
+cat gene_tmp/*.pro_tmp | grep -v '^$' | awk '/^>/{print ">gene_"(NR+1)/2" "$1}!/^>/{print $0}' | sed 's/ >/ /' > 4_gene/proteins_predict.fa
+
+## 基于去冗余的基因先过滤一遍蛋白文件
+awk 'NR==FNR&&NR%2==1{a[$1]=$1}
+    NR!=FNR&&FNR%2==1{if(a[$1]==$1){b=1;print}else{b=0}}
+    NR!=FNR&&FNR%2==0{if(b==1)print}' \
+    4_gene/genes_derep.fa 4_gene/proteins_predict.fa > 4_gene/proteins_derep.fa 
+
+## 蛋白去冗余
+rm -rf 4_gene/proteins_095 mmseqs_tmp2
+
+mmseqs  easy-linclust 4_gene/proteins_derep.fa    4_gene/proteins_095  mmseqs_tmp2 \
+-c 0.9 --cov-mode 1 --min-seq-id 0.95 --threads ${threads} --cluster-mode 2  -v 1 
+rm -rf mmseqs_tmp2
+
+
+# 预测信息文件处理 gff -> gtf
+
+cat gene_tmp/*.gff | grep -v "^#" | sed '/^$/d' \
+    | awk -v OFS="\t" '{print $1,$2,$3,$4,$5,$6,$7,$8}' \
+    | awk -F "\t" '{ print $0"\tgene_id gene_"++count }' \
+    | awk -F" " 'NR==FNR && /^>/ {gsub(">","",$1); $2=gensub(/(.*)_(.*)_(.*)_(.*)_(.*)_(.*)/,"\\1_\\3_\\4","g",$2); a[$2]=$1}
+    NR!=FNR {b=$1"_"$4"_"$5; if(b in a){for(i=1;i<9;i++)printf $i"\t";print "gene_id "a[b]} }' \
+    4_gene/genes_predict.fa - > 4_gene/genes_predict.gtf
+
+#蛋白物种注释
+
+mkdir -p pro2tax
+
+mmseqs createdb 4_gene/proteins_derep.fa 4_gene/proteins_derep.fa_qDB  -v 1
+mmseqs createindex       4_gene/proteins_derep.fa_qDB  tmp_QUERY -v 1
+mmseqs taxonomy 4_gene/proteins_derep.fa_qDB uniref90 pro2tax/taxonomyResult tmp_tax --lca-mode 3 \
+            --search-type 3 -s 2 --threads ${threads} --db-load-mode 0 --max-seq-len 100000 \
+            --lca-ranks superkingdom,phylum,class,order,family,genus,species --tax-lineage 1 \
+            --max-accept 10 --max-seqs 100 --split-memory-limit 100G  
+
+mmseqs createtsv 4_gene/proteins_derep.fa_qDB   pro2tax/taxonomyResult  pro2tax/taxonomyResult.tsv --threads ${threads} -v 1 
+
+cut -f1,5 pro2tax/pro2taxonomy.tsv \
+    | awk -F"\t" '$2~/d_/{print $0}' \
+    | awk -F"[\t;]" '{for(i=1;i<=NF;i++){if(i<NF){printf $i"\t"}else{printf $i"\n"}}}' \
+    | sort -k1V,1 | sed '1iQUERY_ID\tsuperkingdom\tphylum\tclass\torder\tfamily\tgenus\tspecies' \
+    > pro2tax/taxonomy_anno.xls
+
+#基因丰度计算
+# bowtie2+feature
+bowtie2-build --threads ${threads} -q 3_assembly/all_mmseqs_rep_seq.fasta 3_assembly/all_mmseqs_rep_seq
+
+mkdir -p  5_adb
+bowtie2  --sensitive-local -x 3_assembly/all_mmseqs_rep_seq -1 2_cleandata/${sample}_clean_nonhost_R1.fq.gz -2 2_cleandata/${sample}_clean_nonhost_R2.fq.gz -p 10 | pigz -9 > 5_abd/${sample}.sam.gz
+pigz -d -c 5_abd/${sample}.sam.gz | featureCounts -p --countReadPairs -t CDS -g gene_id -a 4_gene/genes_predict.gtf -o pre_${sample}.count -T ${threads}
+awk -F "\t" '/^gene_/{print $1"\t"$NF}' pre_${sample}.count > 5_abd/${sample}.count 
+awk 'NR==FNR&&/^S/{a[$9]=$9}NR==FNR&&/^H/{a[$9]=$11}NR!=FNR{b[a[$1]]+=$2}END{for(i in b)print i"\t"b[i]}' 4_gene/genes_derep.uc 5_abd/${sample}.count > 5_abd/${sample}_genes_derep.count
+coverm contig -t 10 -m count --coupled 2_cleandata/${sample}_clean_nonhost_R1.fq.gz  2_cleandata/${sample}_clean_nonhost_R2.fq.gz --reference 3_assembly/all_mmseqs_rep_seq.fasta -o 5_abd/${sample}.coverm
+
+#蛋白功能注释 
+#KO注释
+
+mmseqs createdb 4_gene/proteins_095_rep_seq.fasta 4_gene/proteins_095_rep_seq.fasta_qDB  -v 1
+mmseqs createindex  4_gene/proteins_095_rep_seq.fasta_qDB  tmp_QUERY -v 1
+mkdir -p KO_anno
+rm -rf  tmp_ko  KO_anno/ko.result.mmseqs*
+mmseqs search 4_gene/proteins_095_rep_seq.fasta_qDB ko.mmseqs2_DB  KO_anno/ko.result.mmseqs tmp_ko \
+    --threads ${threads} --search-type 3 --split-memory-limit 40G \
+    --max-seq-len 100000 --max-accept 1 --max-seqs 100 \
+    --start-sens 1 -s 4 --sens-steps 2 -e 1e-5 -v 1
+mmseqs convertalis 4_gene/proteins_095_rep_seq.fasta_qDB ko.mmseqs2_DB KO_anno/ko.result.mmseqs KO_anno/ko.mmseqs.m8 --threads 8 -v 1
+
+#CAZy注释
+
+mkdir -p CAZy_anno
+rm -rf  tmp_ko  CAZy_anno/CAZy.result.mmseqs*
+mmseqs search 4_gene/proteins_095_rep_seq.fasta_qDB CAZy.mmseqs2_DB  CAZy_anno/CAZy.result.mmseqs tmp_ko \
+    --threads ${threads} --search-type 3 --split-memory-limit 40G \
+    --max-seq-len 100000 --max-accept 1 --max-seqs 100 \
+    --start-sens 1 -s 4 --sens-steps 2 -e 1e-5 -v 1
+mmseqs convertalis 4_gene/proteins_095_rep_seq.fasta_qDB CAZy.mmseqs2_DB CAZy_anno/CAZy.result.mmseqs CAZy_anno/CAZy.mmseqs.m8 --threads ${threads} -v 1
+
+
+#swissprot注释
+
+mkdir -p swissprot_anno
+rm -rf  tmp_ko  swissprot_anno/swissprot.result.mmseqs*
+mmseqs search 4_gene/proteins_095_rep_seq.fasta_qDB swissprot.mmseqs2_DB  swissprot_anno/swissprot.result.mmseqs tmp_ko \
+    --threads ${threads} --search-type 3 --split-memory-limit 40G \
+    --max-seq-len 100000 --max-accept 1 --max-seqs 100 \
+    --start-sens 1 -s 4 --sens-steps 2 -e 1e-5 -v 1
+mmseqs convertalis 4_gene/proteins_095_rep_seq.fasta_qDB swissprot.mmseqs2_DB swissprot_anno/swissprot.result.mmseqs swissprot_anno/swissprot.mmseqs.m8 --threads ${threads} -v 1
+
+#eggNOG注释
+
+mkdir -p eggnog_anno
+rm -rf  tmp_eggnog  eggnog_anno/eggnog.result.mmseqs*
+mmseqs search 4_gene/proteins_095_rep_seq.fasta_qDB eggnog.mmseqs2_DB  eggnog_anno/eggnog.result.mmseqs tmp_eggnog \
+    --threads ${threads} --search-type 3 --split-memory-limit 40G \
+    --max-seq-len 100000 --max-accept 1 --max-seqs 100 \
+    --start-sens 1 -s 4 --sens-steps 2 -e 1e-5 -v 1
+mmseqs convertalis 4_gene/proteins_095_rep_seq.fasta_qDB eggnog.mmseqs2_DB eggnog_anno/eggnog.result.mmseqs eggnog_anno/eggnog.mmseqs.m8 --threads 8 -v 1

@@ -1,0 +1,333 @@
+# 先创建一个目录，用来开展分析
+mkdir -p  Amplicon && cd Amplicon
+
+# 激活环境
+source /opt/software/miniconda2/bin/activate /opt/software/miniconda2/envs/qiime2-2019.4
+
+#导入下机数据，切除引物，去噪，拼接和去嵌合体
+mkdir 2_sequences
+qiime tools import                     --type 'SampleData[PairedEndSequencesWithQuality]'                     --input-path manifest_run1_DMP104480-DMP104310                     --output-path 2_sequences/demux_run1_DMP104480-DMP104310.qza                     --input-format PairedEndFastqManifestPhred33V2 > import_1_1.temp
+qiime cutadapt trim-paired                     --i-demultiplexed-sequences 2_sequences/demux_run1_DMP104480-DMP104310.qza                 \
+    --p-cores 4  --p-front-f AACMGGATTAGATACCCKG                     --p-error-rate 0.2                     --p-times 1                     --p-overlap 17                     --o-trimmed-sequences 2_sequences/demux_no_primer_run1_DMP104480-DMP104310_1.qza                     --p-discard-untrimmed True
+qiime cutadapt trim-paired                     --i-demultiplexed-sequences 2_sequences/demux_no_primer_run1_DMP104480-DMP104310_1.qza      \
+               --p-cores 4  --p-front-r ACGTCATCCCCACCTTCC                     --p-error-rate 0.2                     --p-times 1                     --p-overlap 16                     --o-trimmed-sequences 2_sequences/demux_no_primer_run1_DMP104480-DMP104310.qza              \
+			   --p-discard-untrimmed True
+qiime tools export --input-path 2_sequences/demux_no_primer_run1_DMP104480-DMP104310.qza                         --output-path 2_sequences/demux_no_primer_run1_DMP104480-DMP104310_qza 
+rm -r 2_sequences/demux_no_primer_run1_DMP104480-DMP104310_qza 
+qiime demux summarize                     --p-n 100000                     --i-data 2_sequences/demux_no_primer_run1_DMP104480-DMP104310.qza   \
+                  --o-visualization 2_sequences/demux_no_primer_run1_DMP104480-DMP104310.qzv
+qiime dada2 denoise-paired                     --i-demultiplexed-seqs 2_sequences/demux_no_primer_run1_DMP104480-DMP104310.qza       \
+              --p-trim-left-f 0                     --p-trim-left-r 0                     --p-trunc-len-f 212                    \
+			  --p-trunc-len-r 182                     --p-n-threads 4                     --p-n-reads-learn 1000000             \
+			  --o-table 2_sequences/table_run1_DMP104480-DMP104310.qza                    \
+			  --o-representative-sequences 2_sequences/rep_seqs_run1_DMP104480-DMP104310.qza                 \
+			  --o-denoising-stats 2_sequences/denoising-stats_run1_DMP104480-DMP104310.qza                     --p-min-fold-parent-over-abundance 8 
+qiime metadata tabulate  --m-input-file 2_sequences/denoising-stats_run1_DMP104480-DMP104310.qza  --o-visualization 2_sequences/denoising-stats_run1_DMP104480-DMP104310.qzv
+qiime tools export --input-path 2_sequences/denoising-stats_run1_DMP104480-DMP104310.qzv --output-path 2_sequences/denoising-stats_run1_DMP104480-DMP104310 
+cat 2_sequences/denoising-stats_run1_DMP104480-DMP104310/metadata.tsv >> 2_sequences/dada2_summary.xls
+
+#生成特征标，特征序列，抽平，统计数据量
+
+mkdir -p 3_sOTU
+qiime feature-table merge  --i-tables 2_sequences/table_*.qza  --p-overlap-method 'sum'  --o-merged-table 3_sOTU/table.qza 
+qiime feature-table merge-seqs  --i-data 2_sequences/rep_seqs_*.qza  --o-merged-data 3_sOTU/rep_seqs.qza 
+cat 2_sequences/dada2_summary.xls |sed '/eric/d' |awk '{a[$1]+=$2;b[$1]+=$3;c[$1]+=$4;d[$1]+=$5;e[$1]+=$6}END{for(i in a){print i"\t"a[i]"\t"b[i]"\t"c[i]"\t"d[i]"\t"e[i]}}' |awk -F "\t" 'FNR==NR{a[$1]=$0}FNR<NR{print a[$1]"\t"$NF}' - treat.txt|sed '1s/^/SampleID\tInput\tFiltered\tDenoised\tMerged\tNon-chimeric/' >dsummary.txt
+bash /PERSONALBIO/Work/Mb/Mb07/mdiv-diversity/main_pipeline/qiime2_Bash/qza_modified.sh 3_sOTU/table.qza treat.txt
+bash /PERSONALBIO/Work/Mb/Mb07/mdiv-diversity/main_pipeline/qiime2_Bash/qza_changeID.sh 3_sOTU/table.qza 3_sOTU/rep_seqs.qza ASV_ 
+qiime feature-table summarize  --i-table 3_sOTU/table.qza  --o-visualization 3_sOTU/table.qzv  --m-sample-metadata-file treat.txt 
+qiime feature-table tabulate-seqs  --i-data 3_sOTU/rep_seqs.qza  --o-visualization 3_sOTU/rep_seqs.qzv 
+qiime feature-table filter-features --i-table 3_sOTU/table.qza                                             --p-min-frequency 2                                             --p-min-samples 1                                             --o-filtered-table 3_sOTU/table_filtered.qza
+qiime feature-table filter-seqs --i-data 3_sOTU/rep_seqs.qza                                         --i-table 3_sOTU/table_filtered.qza                                         --o-filtered-data 3_sOTU/rep_seqs_filtered.qza
+qiime tools export  --input-path 3_sOTU/table.qza  --output-path 3_sOTU/table 
+qiime tools export  --input-path 3_sOTU/rep_seqs.qza  --output-path 3_sOTU/rep_seqs 
+mv 3_sOTU/rep_seqs/* 3_sOTU/rep_seqs.fna 
+mv 3_sOTU/table/* 3_sOTU/table.biom 
+qiime tools export  --input-path 3_sOTU/table_filtered.qza  --output-path 3_sOTU/table_filtered 
+qiime tools export  --input-path 3_sOTU/rep_seqs_filtered.qza  --output-path 3_sOTU/rep_seqs_filtered 
+mv 3_sOTU/rep_seqs_filtered/* 3_sOTU/rep_seqs_filtered.fna 
+mv 3_sOTU/table_filtered/* 3_sOTU/table_filtered.biom 
+biom convert --to-tsv -i 3_sOTU/table.biom -o 3_sOTU/table.xls --table-type="OTU table" 
+biom convert --to-tsv  -i 3_sOTU/table_filtered.biom -o 3_sOTU/table_filtered.xls --table-type="OTU table" 
+a=`cat treat.txt | wc -l`
+min_seqs=`for((i=2;i<=a;i++)); do sed '1,2d' 3_sOTU/table_filtered.xls | awk -F "\t" 'BEGIN{sum=0}{sum+=$"'"$i"'"}END{print sum}'; done | sort -n | head -1` 
+rarefy_depth=$[min_seqs*95/100]
+qiime feature-table rarefy --i-table 3_sOTU/table_filtered.qza  --o-rarefied-table 3_sOTU/table_f_even_depth.qza --p-sampling-depth $rarefy_depth 
+qiime feature-table filter-seqs --i-table 3_sOTU/table_f_even_depth.qza --i-data 3_sOTU/rep_seqs_filtered.qza --o-filtered-data 3_sOTU/rep_seqs_f_even_depth.qza 
+qiime tools export  --input-path 3_sOTU/table_f_even_depth.qza  --output-path 3_sOTU/table_f_even_depth 
+qiime tools export  --input-path 3_sOTU/rep_seqs_f_even_depth.qza  --output-path 3_sOTU/rep_seqs_f_even_depth 
+mv 3_sOTU/rep_seqs_f_even_depth/* 3_sOTU/rep_seqs_f_even_depth.fna 
+mv 3_sOTU/table_f_even_depth/* 3_sOTU/table_f_even_depth.biom 
+biom convert --to-tsv -i 3_sOTU/table_f_even_depth.biom -o 3_sOTU/table_f_even_depth.xls --table-type="OTU table" --header-key "taxonomy" 
+
+#建树
+
+qiime alignment mafft --i-sequences 3_sOTU/rep_seqs_filtered.qza --p-n-threads 16  --p-parttree --o-alignment 3_sOTU/aligned_rep_seqs_filtered.qza 
+qiime alignment mask --i-alignment 3_sOTU/aligned_rep_seqs_filtered.qza   --o-masked-alignment 3_sOTU/masked_aligned_rep_seqs_filtered.qza 
+qiime phylogeny fasttree  --i-alignment 3_sOTU/masked_aligned_rep_seqs_filtered.qza  --p-n-threads 12   --o-tree 3_sOTU/unrooted_tree.qza 
+qiime phylogeny midpoint-root    --i-tree 3_sOTU/unrooted_tree.qza  --o-rooted-tree 3_sOTU/rooted_tree.qza 
+qiime tools export  --input-path 3_sOTU/rooted_tree.qza  --output-path 3_sOTU/rooted_tree 
+qiime tools export  --input-path 3_sOTU/unrooted_tree.qza  --output-path 3_sOTU/unrooted_tree 
+mv 3_sOTU/rooted_tree/* 3_sOTU/rooted_rep_set.tre 
+mv 3_sOTU/unrooted_tree/* 3_sOTU/unrooted_rep_set.tre  
+
+#物种注释
+
+mkdir 5_taxonomy
+qiime feature-classifier classify-sklearn --p-read-orientation "same" --p-reads-per-batch 4000 --p-n-jobs 5  --i-classifier silva_132_16SBV5V7_99_7_taxonomy.qza   --i-reads 3_sOTU/rep_seqs.qza  --o-classification 5_taxonomy/taxonomy.qza
+qiime tools export  --input-path 5_taxonomy/taxonomy.qza  --output-path 5_taxonomy/taxonomy 
+sed -i "s/^Feature/\#Feature/" 5_taxonomy/taxonomy/taxonomy.tsv
+sed -i "s/Taxon/taxonomy/" 5_taxonomy/taxonomy/taxonomy.tsv
+
+		
+#功能预测
+
+source /PERSONALBIO/Publicsoftware/miniconda2/bin/activate /PERSONALBIO/Work/Mb/Mb07/.conda/envs/picrust2
+picrust2_pipeline.py -s 3_sOTU/rep_seqs_filtered.fa  -i 3_sOTU/table_filtered.biom  -o picrust2_out_pipeline -p 20  --in_traits KO
+add_descriptions.py -i KO_metagenome_out/pred_metagenome_unstrat.tsv -m KO  -o KO_metagenome_out/pred_metagenome_unstrat_descrip.tsv            
+pathway_pipeline.py -i KO_metagenome_out/pred_metagenome_unstrat.tsv -o KEGG_pathways_out --no_regroup --map KEGG_pathways_to_KO.tsv
+add_descriptions.py -i KEGG_pathways_out/path_abun_unstrat.tsv.gz  --custom_map_table KEGG_pathways_info.tsv.gz  -o KEGG_pathways_out/path_abun_unstrat_descrip.tsv.gz
+
+#网路图绘制
+
+mkdir -p network_sparCC
+cat 5_taxonomy/taxonomy.tsv |cut -f 1,2 |sed 1d|sed 's/[dpcofgs]__//g'|sed 's/;/\t/g'|sed '1s/^/OTU\tdomain\tphylum\tclass\torder\tfamily\tgenus\tspecies\n/' > network_sparCC/tax.txt
+sed '1d' 3_sOTU/table_filtered.xls > network_sparCC/table_filtered.xls
+Rscript /PERSONALBIO/work/microbio/m13/bin/script/prepare.sparCC_data_lhy.R  network_sparCC/table_filtered.xls treat.txt network_sparCC network_sparCC 16
+
+
+#arare
+alpha_rarefaction.py -f -i otu_table.biom -m map.txt -o 4_arare/ -t 3_*/rep_set.tre -f -p /home/M07/parameters/parameters0.97.txt -n 30 &
+
+mkdir 5_specaccum/
+Rscript /home/M00/bin/species_curve.R 3_OTU/otu_modified.xls
+
+mkdir 6_rabund 7_index
+Rscript /home/M00/bin/plot_rank_abundance_graph.R 3_OTU/otu_modified.xls
+alpha_diversity.py -i even_min_seq/otu_even_depth.biom -m simpson,chao1,ACE,shannon -o 7_index/index.txt
+awk -F "\t" 'NR==1{print}NR>1{printf($1"\t%.6f\t",$2);for(i=3;i<NF;i++){printf("%.2f\t", $i)};printf("%.2f\n", $NF)}' 7_index/index.txt > temp
+sed '1s/shannon/Shannon/' temp |sed '1s/chao1/Chao1/' |sed '1s/simpson/Simpson/'> 7_index/index.txt 
+
+#taxa & taxa_summary
+summarize_taxa.py -i otu_table.biom -o 8_taxa -a
+summarize_taxa.py -i otu_table.biom -o 9_taxa_summary
+Rscript /home/M00/bin/create_table2_4_in_report.R 3_OTU/otu_modified.xls
+cp 2summary.txt 8_taxa/summary.txt
+Rscript /home/M00/bin/bar.R 8_taxa/summary.txt species_count
+inkscape -e species_count.png species_count.pdf -d 300
+mv species_count.* 8_taxa
+cd 9_taxa_summary
+Rscript /home/M00/bin/descreasing.R
+plot_taxa_summary.py -i otu_table_L2.txt,otu_table_L3.txt,otu_table_L4.txt,otu_table_L5.txt,otu_table_L6.txt -l Phylum,Class,Order,Family,Genus -c bar,area -o taxa_summary_plots
+cd ../
+
+#L7
+    summarize_taxa.py -i otu_table.biom -L 7 -o 8_taxa/ -a
+    summarize_taxa.py -i otu_table.biom -L 7 -o 9_taxa_summary/
+    cd 9_taxa_summary
+    Rscript /home/M00/bin/descreasing_l7.R
+    plot_taxa_summary.py -c bar,area -i otu_table_L2.txt,otu_table_L3.txt,otu_table_L4.txt,otu_table_L5.txt,otu_table_L6.txt,otu_table_L7.txt -l  Phylum,Class,Order,Family,Genus,Species -o 9_taxa_summary/taxa_summary_plots/
+    cd ../
+
+cat 9_taxa_summary/otu_table_L2.txt |awk -F "\t" '{if($1~/;p__[A-Z][a-z]+/ || $1~/Taxon/) print}'|sed 's/Taxon/ID/'|sed 's/.*__//'|sed 's/ /./'>l2.txt
+Rscript /home/M00/bin/bar.phylum.R l2.txt phylum
+cat 9_taxa_summary/otu_table_L3.txt |awk -F "\t" '{if($1~/;c__[A-Z][a-z]+/ || $1~/Taxon/) print}'|sed 's/Taxon/ID/'|sed 's/.*__//'|sed 's/ /./'>l3.txt
+Rscript /home/M00/bin/bar.phylum.R l3.txt class
+cat 9_taxa_summary/otu_table_L4.txt |awk -F "\t" '{if($1~/;o__[A-Z][a-z]+/ || $1~/Taxon/) print}'|sed 's/Taxon/ID/'|sed 's/.*__//'|sed 's/ /./'>l4.txt
+Rscript /home/M00/bin/bar.phylum.R l4.txt order
+cat 9_taxa_summary/otu_table_L5.txt |awk -F "\t" '{if($1~/;f__[A-Z][a-z]+/ || $1~/Taxon/) print}'|sed 's/Taxon/ID/'|sed 's/.*__//'|sed 's/ /./'>l5.txt
+Rscript /home/M00/bin/bar.phylum.R l5.txt family
+cat 9_taxa_summary/otu_table_L6.txt |awk -F "\t" '{if($1~/;g__[A-Z][a-z]+/ || $1~/Taxon/) print}'|sed 's/Taxon/ID/'|sed 's/.*__//'|sed 's/ /./'>l6.txt
+Rscript /home/M00/bin/bar.phylum.R l6.txt genus
+#cat 9_taxa_summary/otu_table_L*.txt |sed 's/.*;//'|sed 's/[acofg]__//'|awk -F "\t" '{if($1==""){$1="unclassified"a[0]"\t";a[0]+=1};print}'|sed 's/Taxon/ID/'|sed 's/ /./' >file
+mv bar*pdf 9_taxa_summary/
+inkscape -e 9_taxa_summary/phylum.png 9_taxa_summary/bar_phylum.pdf -d 300
+inkscape -e 9_taxa_summary/class.png 9_taxa_summary/bar_class.pdf -d 300
+inkscape -e 9_taxa_summary/order.png 9_taxa_summary/bar_order.pdf -d 300
+inkscape -e 9_taxa_summary/family.png 9_taxa_summary/bar_family.pdf -d 300
+inkscape -e 9_taxa_summary/genus.png 9_taxa_summary/bar_genus.pdf -d 300
+#L7
+    cat 9_taxa_summary/otu_table_L7.txt |awk -F "\t" '{if($1~/;s__[a-z]+/ || $1~/Taxon/) print}'|sed 's/Taxon/ID/'|sed 's/.*__//'|sed 's/ /./'>l7.txt
+    Rscript /home/M00/bin/bar.phylum.R l7.txt species
+    mv bar*pdf 9_taxa_summary/
+    inkscape -e 9_taxa_summary/species.png 9_taxa_summary/bar_species.pdf -d 300
+
+#10_diff
+cat 8_taxa/otu_table_L6.txt |awk -F "\t" '{if($1~/;g__[A-Z][a-z]+/ || $1~/Taxon/) print}'|sed 's/Taxon/ID/'|sed 's/.*__//'|sed 's/ /./'>dl6.txt 
+cat 8_taxa/otu_table_L2.txt |awk -F "\t" '{if($1~/;p__[A-Z][a-z]+/ || $1~/Taxon/) print}'|sed 's/Taxon/ID/'|sed 's/.*__//'|sed 's/ /./'>dl2.txt
+awk -F "\t" '{if($1!~/Other$/ && $1!~/[1-9]/) print}' dl6.txt|sed 's/\.0\t/\t/g' |sed 's/\.0$//'| sed 's/.*__//'|sed 's/ /./'> g.txt 
+awk -F "\t" '{if($1!~/Other$/ && $1!~/[1-9]/) print}' dl2.txt|sed 's/\.0\t/\t/g' |sed 's/\.0$//'|sed 's/.*__//'|sed 's/ /./' > p.txt 
+bash /home/M00/bin/metastats.sh
+#L7
+    cat 8_taxa/otu_table_L7.txt |awk -F "\t" '{if($1~/;s__[a-z]+/ || $1~/Taxon/) print}'|sed 's/Taxon/ID/'|sed 's/.*__//'|sed 's/ /./'>dl7.txt 
+    awk -F "\t" '{if($1!~/Other$/ && $1!~/[1-9]/) print}' dl7.txt|sed 's/\.0\t/\t/g' |sed 's/\.0$//'|sed 's/.*__//'|sed 's/ /./' > s.txt 
+    bash /home/M00/bin/metastats_l7.sh
+    
+#diff_group
+python /home/M00/bin/make_otu_group.py map.txt 3_OTU/otu_modified.xls
+biom convert -o otu_table_group.biom -i 3_OTU/otu_modified_group.xls --table-type="otu table" --process-obs-metadata=taxonomy
+
+summarize_taxa.py -i otu_table_group.biom -o 8_taxa_group -a
+summarize_taxa.py -i otu_table_group.biom -o 9_taxa_summary_group
+cd 9_taxa_summary_group
+Rscript /home/M00/bin/descreasing_g.R
+plot_taxa_summary.py -i otu_table_*L2.txt,otu_table_*L3.txt,otu_table_*L4.txt,otu_table_*L5.txt,otu_table_*L6.txt -l Phylum,Class,Order,Family,Genus -c bar,area -o taxa_summary_plots
+cd ../
+cat 9_taxa_summary_group/otu_table_group_L2.txt |awk -F "\t" '{if($1~/;p__[A-Z][a-z]+/ || $1~/Taxon/) print}'|sed 's/Taxon/ID/'|sed 's/.*__//'|sed 's/ /./'>l2g.txt
+Rscript /home/M00/bin/bar.phylum.R l2g.txt phylum
+cat 9_taxa_summary_group/otu_table_group_L3.txt |awk -F "\t" '{if($1~/;c__[A-Z][a-z]+/ || $1~/Taxon/) print}'|sed 's/Taxon/ID/'|sed 's/.*__//'|sed 's/ /./'>l3g.txt
+Rscript /home/M00/bin/bar.phylum.R l3g.txt class
+cat 9_taxa_summary_group/otu_table_group_L4.txt |awk -F "\t" '{if($1~/;o__[A-Z][a-z]+/ || $1~/Taxon/) print}'|sed 's/Taxon/ID/'|sed 's/.*__//'|sed 's/ /./'>l4g.txt
+Rscript /home/M00/bin/bar.phylum.R l4g.txt order
+cat 9_taxa_summary_group/otu_table_group_L5.txt |awk -F "\t" '{if($1~/lefse;f__[A-Z][a-z]+/ || $1~/Taxon/) print}'|sed 's/Taxon/ID/'|sed 's/.*__//'|sed 's/ /./'>l5g.txt
+Rscript /home/M00/bin/bar.phylum.R l5g.txt family
+cat 9_taxa_summary_group/otu_table_group_L6.txt |awk -F "\t" '{if($1~/;g__[A-Z][a-z]+/ || $1~/Taxon/) print}'|sed 's/Taxon/ID/'|sed 's/.*__//'|sed 's/ /./'>l6g.txt
+Rscript /home/M00/bin/bar.phylum.R l6g.txt genus
+mv bar*pdf 9_taxa_summary_group/
+
+bash /home/M00/bin/diff.sh
+
+#L7
+    summarize_taxa.py -i otu_table_group.biom -L 7 -o 8_taxa_group -a
+    summarize_taxa.py -i otu_table_group.biom -L 7 -o 9_taxa_summary_group
+    cd 9_taxa_summary_group
+    Rscript /home/M00/bin/descreasing_g_l7.R
+    plot_taxa_summary.py -i otu_table_*L2.txt,otu_table_*L3.txt,otu_table_*L4.txt,otu_table_*L5.txt,otu_table_*L6.txt,otu_table_*L7.txt -l Phylum,Class,Order,Family,Genus,Species -c bar,area -o taxa_summary_plots
+    cd ../
+    bash /home/M00/bin/diff_l7.sh
+
+inkscape -e 10_diff/diff_group_phylum.png 10_diff/diff_group_phylum.png -d 300
+inkscape -e 10_diff/diff_group_genus.png 10_diff/diff_group_genus.png -d 300
+#lefse
+mkdir 11_lefse
+mkdir lefse_diff_taxa
+cut -f4 map.txt |tr -t '\n' '\t'|sed 's/[\t]*$//'|sed 's/$/\n/' > lefse.txt
+    #如果有Subgroup请运行 cut -f5 map.txt |tr -t '\n' '\t'|sed 's/[\t]*$//'|sed 's/$/\n/' >> lefse.txt
+cat 9_taxa_summary/otu_table_L6.txt |awk -F "\t" '{if($1~/;g__[A-Z][a-z]+/ || $1~/Taxon/) print}'|sed 's/ /_/g'|sed 's/Taxon/id/'|sed 's/;/\|/g'|sed 's/k__//'|sed 's/p__//'|sed 's/c__//'|sed 's/o__//'|sed 's/f__//'|sed 's/g__//' >> lefse.txt
+format_input.py lefse.txt lefse.in -c 1 -s 2 -u 3 -o 1000000
+run_lefse.py lefse.in lefse_results.txt
+plot_res.py  --dpi 300 --format png lefse_results.txt lefse_effect_size_rank.png
+#plot_cladogram.py --labeled_stop_lev 7  --abrv_stop_lev 7 --dpi 300 --format png lefse_results.txt lefse_cladogram.png
+ncol=$[`cat lefse_results.txt|awk -F "\t" '{if($3!=""){print$3}}'|wc -l`/50+1]
+python /home/M00/bin/plot_cladogram.py --labeled_stop_lev 7  --abrv_stop_lev 7 --dpi 300 --format png --ncol $ncol lefse_results.txt lefse_cladogram.png
+plot_features.py --width 15 --format png --dpi 300 lefse.in lefse_results.txt lefse_diff_taxa/ #width宽度如有必要酌情调整
+mv lefse_* ./11_lefse/
+ls 11_lefse/lefse_diff_taxa/ | head -n 1 | sed '1a lefse.png' | sed 's/^/11_lefse\/lefse_diff_taxa\//' |sed '2s/lefse_diff_taxa\///' | xargs -n 2 cp
+
+mkdir 15_megan
+Rscript /home/M00/bin/megan.R map.txt 3_OTU/otu_modified.xls
+biom convert -o megan.biom -i otu_modified_megan.txt --table-type="otu table" --process-obs-metadata=taxonomy
+mv megan.biom 15*
+#Megan作图 保存PDF
+pdfunite 15_megan/megan.pdf 15_megan/megan-legend.pdf 15_megan/output.pdf
+inkscape -e 15_megan/megan.png 15_megan/output.pdf -d 300
+
+mkdir 16_community
+cat 9_taxa_summary/otu_table_L2.txt |awk -F "\t" '{if($1~/;p__[A-Z][a-z]+/ || $1~/Taxon/) print}'|sed 's/Taxon/ID/'>a.txt 
+cat 9_taxa_summary/otu_table_L3.txt |awk -F "\t" '{if($1~/;c__[A-Z][a-z]+/) print}'>>a.txt 
+cat 9_taxa_summary/otu_table_L4.txt |awk -F "\t" '{if($1~/;o__[A-Z][a-z]+/) print}'>>a.txt 
+cat 9_taxa_summary/otu_table_L5.txt |awk -F "\t" '{if($1~/;f__[A-Z][a-z]+/) print}'>>a.txt 
+cat 9_taxa_summary/otu_table_L6.txt |awk -F "\t" '{if($1~/;g__[A-Z][a-z]+/) print}'>>a.txt 
+#cat 9_taxa_summary/otu_table_L7.txt |awk -F "\t" '{if($1~/;s__[a-z]+/) print}'>>a.txt 
+awk -F "\t" '{if($1!~/Other$/ && $1!~/unidentified$/) print}' a.txt |sed 's/;/|/g' >b
+cat b |awk '{if($1!~/ /) print}'>aa
+sed 's/(/[/g' aa|sed 's/)/]/' >a 
+
+sh /home/M00/bin/graphlan.sh
+
+mkdir 17_krona
+python /home/M00/bin/divide_sample_from_taxa.py 8_taxa/otu_table_L6.txt
+
+mkdir 18_heatmap
+cat 9_taxa_summary/otu_table_L6.txt |awk -F "\t" '{if($1~/;g__[A-Z][a-z]+/ || $1~/Taxon/) print}'|sed 's/Taxon/ID/'|sed 's/.*__//'|sed 's/ /./'>hl6.txt 
+awk -F "\t" '{if($1!~/Other$/ && $1!~/[1-9]/) print}' hl6.txt|sed 's/\.0\t/\t/g' |sed 's/\.0$//'| sed 's/.*__//'|sed 's/ /./'> hg.txt 
+Rscript /home/M00/bin/Heatmap.R hg.txt 
+mv heatmap.* 18_heatmap/
+make_otu_heatmap_html.py -i otu_table.biom -o 18_heatmap  &
+
+cat 7otu_table_L6.txt |awk -F "\t" '{if($1~/;g__[A-Z][a-z]+/ || $1~/Taxon/) print}'|sed 's/Taxon/ID/'|sed 's/.*__//'|sed 's/ /./'>7hl6.txt 
+awk -F "\t" '{if($1!~/Other$/ && $1!~/[1-9]/) print}' 7hl6.txt|sed 's/\.0\t/\t/g' |sed 's/\.0$//'| sed 's/.*__//'|sed 's/ /./'> 7hg.txt 
+Rscript /home/M00/bin/Heatmap.R 7hg.txt
+
+mkdir  19_PCA
+/home/M02/software/R-3.3.2/bin/Rscript  /home/M00/bin/plot_pca_names_graph.R map.txt  9_taxa_summary/otu_table_L6.txt
+mv PCA* 19_PCA
+inkscape -e 19_PCA/pca.png 19_PCA/PCA_Treat1.pdf -d 300
+Rscript /home/M00/bin/plot_3d_pca_graph.R  map.txt 9_taxa_summary/otu_table_L6.txt
+mv 3D-PCA.pdf 19_PCA/
+inkscape -e 19_PCA/pca_3d.png 19_PCA/3D-PCA.pdf
+Rscript /home/M00/bin/otu-L6.round.R
+biom convert -o otu_L6.biom -i otu_table_L6.xls --table-type="otu table" --process-obs-metadata=taxonomy
+beta_diversity_through_plots.py -i otu_L6.biom  -m map.txt -o 19_PCA/3D-PCA -t 3_OTU/rep_set.tre -p /home/M00/bin/parameters.euclidean.txt
+
+
+#beta
+beta_diversity_through_plots.py -i even_min_seq/otu_even_depth.biom -m map.txt -o  20_bdiv -t 3_OTU/rep_set.tre 
+make_prefs_file.py -m map.txt -o 20_bdiv/prefs.txt  --mapping_headers_to_use Treat1
+make_2d_plots.py -p 20_bdiv/prefs.txt -i 20_bdiv/weighted_unifrac_pc.txt -o 20_bdiv/weighted_unifrac_2d_continuous/ -m map.txt 
+make_2d_plots.py  -i 20_bdiv/weighted_unifrac_pc.txt -o 20_bdiv/weighted_unifrac_2d_discrete/ -m map.txt 
+make_2d_plots.py -p 20_bdiv/prefs.txt -i 20_bdiv/unweighted_unifrac_pc.txt -o 20_bdiv/unweighted_unifrac_2d_continuous/ -m map.txt
+make_2d_plots.py  -i 20_bdiv/unweighted_unifrac_pc.txt -o 20_bdiv/unweighted_unifrac_2d_discrete/ -m map.txt 
+
+    #3样本PCoA-2D
+    beta_diversity.py -i even_min_seq/otu_even_depth.biom -t 3_OTU/rep_set.tre -o 20_bdiv/
+    principal_coordinates.py -i 20_bdiv/unweighted_unifrac_otu_even_depth.txt -o 20_bdiv/unweighted_unifrac_pc.txt  
+    make_2d_plots.py -i 20_bdiv/unweighted_unifrac_pc.txt -o 20_bdiv/unweighted_pcoa_2d_plot -m map.txt
+    principal_coordinates.py -i 20_bdiv/weighted_unifrac_otu_even_depth.txt -o 20_bdiv/weighted_unifrac_pc.txt
+    make_2d_plots.py -i 20_bdiv/weighted_unifrac_pc.txt -o 20_bdiv/weighted_pcoa_2d_plot -m map.txt
+    mv 20_bdiv/unweighted_unifrac_otu_even_depth.txt 20_bdiv/unweighted_unifrac_dm.txt
+    mv 20_bdiv/weighted_unifrac_otu_even_depth.txt 20_bdiv/weighted_unifrac_dm.txt
+
+#NMDS
+nmds.py -i  20_bdiv/unweighted_unifrac_dm.txt  -o  20_bdiv/unweight.txt 
+nmds.py -i  20_bdiv/weighted_unifrac_dm.txt  -o  20_bdiv/weight.txt 
+/home/M02/software/R-3.3.2/bin/Rscript  /home/M00/bin/plot_nmds_names.R map.txt 20_bdiv/unweight.txt unweighted_unifrac
+mv nmds.unweighted_unifrac.pdf  20_bdiv/NMDS_unweighted.pdf
+/home/M02/software/R-3.3.2/bin/Rscript  /home/M00/bin/plot_nmds_names.R map.txt 20_bdiv/weight.txt weighted_unifrac
+mv nmds.weighted_unifrac.pdf  20_bdiv/NMDS_weighted.pdf
+inkscape -e 20_bdiv/nmds.png 20_bdiv/NMDS_unweighted.pdf -d 300
+inkscape -e 20_bdiv/nmds_weighted.png 20_bdiv/NMDS_weighted.pdf -d 300
+
+#upgma
+upgma_cluster.py -i 20_bdiv/unweighted_unifrac_dm.txt -o 20_bdiv/unweighted_unifrac.tre
+upgma_cluster.py -i 20_bdiv/weighted_unifrac_dm.txt -o 20_bdiv/weighted_unifrac.tre
+#Mega作图 weighted_unifrac.pdf/unweighted_unifrac.pdf
+inkscape -e 20_bdiv/hcluster.png 20_bdiv/unweighted_unifrac.pdf -d 300
+inkscape -e 20_bdiv/hcluster_weighted.png 20_bdiv/weighted_unifrac.pdf -d 300
+
+#boxplot
+cat map.txt |sed '1s/Treat/Group/g' >bmap
+make_distance_boxplots.py -m bmap -d 20_bdiv/unweighted_unifrac_dm.txt -o 20_bdiv/boxplot -f Group1 
+make_distance_boxplots.py -m bmap -d 20_bdiv/weighted_unifrac_dm.txt -o 20_bdiv/boxplot_w -f Group1
+inkscape -e 20_bdiv/boxplot/boxplot.png 20_bdiv/boxplot/Group1_Distances.pdf -d 300
+mv 20_bdiv/boxplot/Group1_Distances.pdf 20_bdiv/boxplot/boxplot.pdf
+mv 20_bdiv/boxplot_w/Group1_Distances.pdf 20_bdiv/boxplot_w/boxplot.pdf
+
+mkdir 24_plsda
+/home/M02/software/R-3.3.2/bin/Rscript /home/M00/bin/PLSDA.R 9_taxa_summary/otu_table_L6.txt map.txt plsda
+mv plsda.p* plsda.vip.xls 24_plsda/
+
+mkdir 25_adonis
+compare_categories.py --method adonis -i 20_bdiv/unweighted_unifrac_dm.txt -m map.txt -o 25_adonis -n 999 -c Treat1
+compare_categories.py --method adonis -i 20_bdiv/weighted_unifrac_dm.txt -m map.txt -o w -n 999 -c Treat1
+#mv 25_adonis/adonis_results.txt 25_adonis/adonis_results_unweighted.txt
+cat 25_adonis/adonis_results.txt |convert -background white -fill black -font FreeMono-Bold -pointsize 18 label:@- 25_adonis/adonis.png
+mv w/adonis_results.txt 25_adonis/adonis_results_weighted.txt
+cat 25_adonis/adonis_results_weighted.txt |convert -background white -fill black -font FreeMono-Bold -pointsize 18 label:@- 25_adonis/adonis_weighted.png
+
+mkdir 26_anosim
+compare_categories.py --method anosim -i 20_bdiv/unweighted_unifrac_dm.txt -m map.txt -o 26_anosim -n 999 -c Treat1
+compare_categories.py --method anosim -i 20_bdiv/weighted_unifrac_dm.txt -m map.txt -o w -n 999 -c Treat1
+mv w/anosim_results.txt 26_anosim/anosim_results_weighted.txt
+mv 26_anosim/anosim_results.txt 26_anosim/anosim_results_unweighted.txt
+cat 26_anosim/anosim_results_unweighted.txt 26_anosim/anosim_results_weighted.txt |sed '3d'|sed '2s/ANOSIM/Unweighted UniFrac/' |sed '3s/ANOSIM/Weighted UniFrac/' >26_anosim/anosim_results.txt
+
+#27_random_forests
+supervised_learning.py -i even_min_seq/otu_even_depth.biom -m map.txt -o 27_random_forests --ntree 1000 -e cv10 -c Treat1
+rm 27*/cv* 27*/mis*
+
+
+
+
+
+
+
